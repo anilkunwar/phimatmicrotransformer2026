@@ -1,1 +1,1 @@
-TITLE-ABS-KEY ("PbTe" OR "SnSe" OR "GeTe") AND ("band convergence" OR "resonant level" OR "band structure") AND ("doping" OR "alloying") AND ("seebeck coefficient" OR "power factor")
+TITLE-ABS-KEY ("PbTe" OR "SnSe" OR "GeTe") AND ("band convergence" OR "resonant level" OR "band structure") AND ("doping" OR "alloying") AND ("seebeck coefficient" OR "power factor") AND ("high entropy" OR "multicomponent" OR "complex chalcogenide" OR "multi-cation" OR "solid solution")
