@@ -17,3 +17,7 @@ v4: LLM query and graph stage share the different RAM space. Since the GraphSAGE
 
 [![integratedllmgraphte](https://img.shields.io/badge/thermoelectrics-v4-red)](https://thermoelectrics-concept-graph-microtransformer4.streamlit.app/) (Options of query-distilled concept graph and default entirety analysis concept graph, Customizable nodes in the Concept Graph)
 
+[![integratedllmgraphte](https://img.shields.io/badge/thermoelectrics-v5-red)](https://thermoelectrics-concept-graph-microtransformer5.streamlit.app/) (Options of query-distilled concept graph and default entirety analysis concept graph, Customizable nodes in the Concept Graph)
+
+[![integratedllmgraphte](https://img.shields.io/badge/thermoelectrics-v6-red)](https://thermoelectrics-concept-graph-microtransformer6.streamlit.app/) (Options of query-distilled concept graph and default entirety analysis concept graph, Customizable nodes in the Concept Graph)
+
