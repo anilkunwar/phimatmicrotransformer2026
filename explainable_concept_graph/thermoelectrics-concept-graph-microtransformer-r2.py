@@ -7934,8 +7934,8 @@ def main() -> None:
                             status.write(
                                 f"Extracted {completed}/{total} documents..."
                             )
-                    if completed % 50 == 0:
-                        time.sleep(0.01)
+                        if completed % 50 == 0:
+                            time.sleep(0.01)
 
                 all_concepts = [
                     c if c is not None else [] for c in all_concepts
@@ -8045,8 +8045,8 @@ def main() -> None:
 
                 gnn_model, final_emb, adj_indices, adj_values = train_gnn(
                     node_features, nx_graph, concept_to_id,
-                    pos_pairs, neg_pairs, training_progress,,
-                    epochs=15
+                    pos_pairs, neg_pairs, training_progress,
+                    epochs=15,
                 )
                 st.success("GNN training complete")
                 progress_bar.progress(0.80)
