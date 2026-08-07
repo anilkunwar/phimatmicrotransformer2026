@@ -1,1 +1,25 @@
-
+streamlit
+starlette<0.40.0  # use older version of starlette to prevent TypeError: GZipResponder
+#matplotlib<3.9.0
+matplotlib
+scipy
+plotly
+seaborn
+torch>=2.2.0
+torchvision
+sentence-transformers
+transformers
+accelerate
+scikit-learn
+pandas
+numpy
+networkx
+pyvis
+h5py
+joblib
+scikit-image
+dgl
+ollama
+kaleido
+holoviews
+bokeh
