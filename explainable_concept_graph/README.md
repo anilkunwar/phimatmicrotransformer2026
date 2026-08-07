@@ -14,5 +14,6 @@ v1-v3 - LLM query and graph stage share the same RAM space
 [![integratedllmgraphte](https://img.shields.io/badge/thermoelectrics-v3-brightgreen)](https://thermoelectrics-concept-graph-microtransformer3.streamlit.app/) (Options of query-distilled concept graph and default entirety analysis concept graph, Customizable nodes in the Concept Graph)
 
 v4: LLM query and graph stage share the different RAM space
-[![integratedllmgraphte](https://img.shields.io/badge/thermoelectrics-v4-brightgreen)](https://thermoelectrics-concept-graph-microtransformer4.streamlit.app/) (Options of query-distilled concept graph and default entirety analysis concept graph, Customizable nodes in the Concept Graph)
+
+[![integratedllmgraphte](https://img.shields.io/badge/thermoelectrics-v4-red)](https://thermoelectrics-concept-graph-microtransformer4.streamlit.app/) (Options of query-distilled concept graph and default entirety analysis concept graph, Customizable nodes in the Concept Graph)
 
