@@ -28,17 +28,8 @@ Place JSON/BibTeX/CSV files in ./json_metadatabase/ folder next to this script.
 # ============================================================================
 # IMPORTS (unchanged)
 # ============================================================================
-import os
-# === STREAMLIT CLOUD COMPATIBILITY: Thread Limits ===
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
 import streamlit as st
 import torch
-torch.set_num_threads(1)
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.sparse as sparse
@@ -2387,7 +2378,7 @@ def sample_edges_for_training(
         target_negs = min(len(pos_pairs) * 3 if pos_pairs else 30, 5000)
     attempts = 0
     max_attempts = 50000
-    if memory_safe or len(valid_concepts) > 150:
+    if memory_safe:
         path_lengths = {}
     else:
         try:
@@ -2449,7 +2440,7 @@ class SparseGraphSAGE(nn.Module):
 
 def train_gnn(
     node_features, nx_graph, concept_to_id, pos_pairs, neg_pairs,
-    progress_callback=None, epochs: int = 15, lr: float = 1e-3,
+    progress_callback=None, epochs: int = 50, lr: float = 1e-3,
 ):
     num_nodes = len(concept_to_id)
     in_dim = node_features.shape[1] if node_features.numel() > 0 else 384
@@ -5334,6 +5325,8 @@ class IncrementalGraphBuilder(ReasoningEnhancedGraphBuilder):
         batch_doc_freq: Dict[str, int],
         embed_model=None,
         config: Dict = None,
+        skip_semantic: bool = False,
+        skip_inference: bool = False,
     ) -> nx.Graph:
         if config is None:
             config = get_adaptive_config(1000)
@@ -5366,11 +5359,11 @@ class IncrementalGraphBuilder(ReasoningEnhancedGraphBuilder):
                 edge_type='cooccurrence',
                 inferred=False,
             )
-        if embed_model and len(valid_concepts) >= 10:
+        if not skip_semantic and embed_model and len(valid_concepts) >= 10:
             self._add_semantic_edges(
                 nx_graph, valid_concepts, embed_model, config
             )
-        if st.session_state.get('use_inference', True):
+        if not skip_inference and st.session_state.get('use_inference', True):
             self._add_inferred_edges(nx_graph, valid_concepts)
         self._add_hierarchical_edges(nx_graph, valid_concepts)
         self._compute_final_weights(nx_graph, config)
@@ -5408,12 +5401,12 @@ def render_batch_processing_controls() -> None:
     if not st.session_state.get("batch_mode", False):
         return
     st.slider(
-        "Batch size (documents)", 100, 2000, 1000, 100,
+        "Batch size (documents)", 100, 2000, 500, 100,
         key="batch_size",
-        help="Smaller batches = lower peak memory but more merge steps.",
+        help="Recommended: 200–500 for focused queries (lower peak memory). 1000 for full builds.",
     )
     st.slider(
-        "GNN epochs (final training)", 10, 50, 15, 5,
+        "GNN epochs (final training)", 10, 50, 40, 5,
         key="batch_gnn_epochs",
         help="GNN is trained ONCE on the final merged graph.",
     )
@@ -5548,9 +5541,12 @@ def run_batch_analysis(
         else:
             config["MIN_CONCEPT_FREQ"] = min(config["MIN_CONCEPT_FREQ"], 3)
         config["USE_SEMANTIC_CLUSTERING"] = False
+        config["SIMILARITY_THRESHOLD"] = 0.9
+        config["TOP_N_CONCEPTS"] = min(config["TOP_N_CONCEPTS"], 200)
         st.info(
             f"🎯 Query-focused batch mode: {wl_size} whitelisted concepts. "
-            f"MIN_CONCEPT_FREQ lowered to {config['MIN_CONCEPT_FREQ']}."
+            f"MIN_CONCEPT_FREQ={config['MIN_CONCEPT_FREQ']}, "
+            f"semantic clustering OFF, TOP_N capped at {config['TOP_N_CONCEPTS']}."
         )
 
     use_ontology = st.session_state.get('use_ontology', True)
@@ -5600,11 +5596,46 @@ def run_batch_analysis(
         extractor = bs["extractor"]
         whitelist = st.session_state.get('last_query_whitelist', None)
 
+        # --- PRE-FILTER: compile regex from whitelist (canonical + synonyms) ---
+        whitelist_pattern = None
+        _is_qf_local = st.session_state.get('query_focused_build', False) and whitelist and len(whitelist) > 0
+        if _is_qf_local:
+            search_terms: List[str] = []
+            for c in whitelist:
+                term = c.replace('_', ' ').lower()
+                if len(term) > 2:
+                    search_terms.append(term)
+                if ontology and c in ontology.concepts:
+                    for syn in ontology.concepts[c].synonyms:
+                        s = syn.lower().strip()
+                        if len(s) > 2 and s not in search_terms:
+                            search_terms.append(s)
+            if search_terms:
+                try:
+                    whitelist_pattern = re.compile(
+                        r'\b(' + '|'.join(re.escape(t) for t in search_terms) + r')\b',
+                        re.IGNORECASE,
+                    )
+                except re.error:
+                    whitelist_pattern = None
+        # --- END PRE-FILTER ---
+
         for local_i, (_, row) in enumerate(batch_df.iterrows()):
             text = " ".join([
                 str(row[col]) for col in selected_text_cols
                 if col in row and pd.notna(row[col])
             ])
+
+            # Skip docs that don't contain any whitelisted term
+            if whitelist_pattern and not whitelist_pattern.search(text):
+                bs["docs_processed"] += 1
+                if (local_i + 1) % 100 == 0 or (local_i + 1) == n_this:
+                    frac = (batch_num + (local_i + 1) / n_this) / total_batches
+                    progress_bar.progress(min(0.90 * frac, 0.90))
+                    with status:
+                        st.write(f"  … {local_i + 1}/{n_this} docs (pre-filtered)")
+                continue
+
             if use_ontology and extractor is not None:
                 concepts = extractor.extract_from_text(
                     text, start + local_i,
@@ -5635,8 +5666,6 @@ def run_batch_analysis(
                 progress_bar.progress(min(0.90 * frac, 0.90))
                 with status:
                     st.write(f"  … {local_i + 1}/{n_this} docs extracted")
-            if (local_i + 1) % 50 == 0:
-                time.sleep(0.01)
 
         bs["all_concepts"].extend(batch_concepts)
         bs["all_metrics"].extend(batch_metrics)
@@ -5668,10 +5697,16 @@ def run_batch_analysis(
         batch_valid = batch_valid[:top_n]
         concept_to_id_batch = {c: i for i, c in enumerate(batch_valid)}
 
+        quick_build = st.session_state.get('quick_build_mode', False)
+        skip_semantic = quick_build or (_is_qf_local and len(whitelist) < 30)
+        skip_inference = quick_build or (_is_qf_local and len(whitelist) < 30)
+
         if use_ontology and bs["builder"] is not None:
             batch_graph = bs["builder"].build_batch_graph(
                 batch_concepts, batch_valid, concept_to_id_batch,
                 batch_doc_freq, embed_model, config,
+                skip_semantic=skip_semantic,
+                skip_inference=skip_inference,
             )
         else:
             batch_graph = build_hybrid_graph(
@@ -5752,43 +5787,7 @@ def run_batch_analysis(
         }
         progress_bar.progress(0.90)
 
-        with status:
-            st.write("🔢 Generating node embeddings...")
-        try:
-            with torch.no_grad():
-                embeddings = embed_model.encode(
-                    valid_concepts, show_progress_bar=False,
-                    batch_size=32, convert_to_numpy=True,
-                )
-            node_features = torch.tensor(embeddings, dtype=torch.float32)
-            del embeddings
-        except Exception:
-            node_features = torch.randn(len(valid_concepts), 384)
-        gc.collect()
-
-        with status:
-            st.write("🧠 Training GraphSAGE (final, once)...")
-        pos_pairs, neg_pairs = sample_edges_for_training(
-            merged, valid_concepts, concept_to_id, config, memory_safe=True,
-        )
-        epochs = int(st.session_state.get("batch_gnn_epochs", 40))
-
-        def _gnn_progress(epoch, loss):
-            frac = 0.90 + (epoch / max(epochs, 1)) * 0.05
-            progress_bar.progress(min(frac, 0.95))
-            if epoch % 10 == 0:
-                with status:
-                    st.write(f"Epoch {epoch}/{epochs} | Loss: {loss:.4f}")
-
-        gnn_model, final_emb, adj_indices, adj_values = train_gnn(
-            node_features, merged, concept_to_id,
-            pos_pairs, neg_pairs, _gnn_progress, epochs=epochs,
-        )
-        del pos_pairs, neg_pairs, adj_indices, adj_values
-        gc.collect()
-
-        with status:
-            st.write("🎯 Scoring research directions...")
+        # Pre-compute concept properties regardless of mode (used for metadata)
         concept_properties: Dict[str, float] = {}
         all_metrics = bs["all_metrics"]
         for concept in valid_concepts:
@@ -5800,27 +5799,76 @@ def run_batch_analysis(
             concept_properties[concept] = (
                 float(np.median(values)) if values else 0.0
             )
-        X_feat: List[List[float]] = []
-        y_target: List[float] = []
-        for u, v in merged.edges():
-            pu = concept_properties.get(u, 0)
-            pv = concept_properties.get(v, 0)
-            w = merged[u][v].get('weight', 1)
-            X_feat.append([pu, pv, w])
-            y_target.append(
-                max(pu, pv) * 1.08 if max(pu, pv) > 0 else 0
+
+        quick_build = st.session_state.get('quick_build_mode', False)
+        if quick_build:
+            st.info("⚡ Quick Build mode: skipping GNN training and research direction scoring.")
+            node_features = None
+            gnn_model = None
+            final_emb = None
+            ridge = None
+            top_scores = pd.DataFrame()
+        else:
+            with status:
+                st.write("🔢 Generating node embeddings...")
+            try:
+                with torch.no_grad():
+                    embeddings = embed_model.encode(
+                        valid_concepts, show_progress_bar=False,
+                        batch_size=32, convert_to_numpy=True,
+                    )
+                node_features = torch.tensor(embeddings, dtype=torch.float32)
+                del embeddings
+            except Exception:
+                node_features = torch.randn(len(valid_concepts), 384)
+            gc.collect()
+
+            with status:
+                st.write("🧠 Training GraphSAGE (final, once)...")
+            pos_pairs, neg_pairs = sample_edges_for_training(
+                merged, valid_concepts, concept_to_id, config, memory_safe=True,
             )
-        ridge = None
-        if len(X_feat) > 5:
-            ridge = Ridge(alpha=1.0).fit(
-                np.array(X_feat), np.array(y_target)
+            epochs = int(st.session_state.get("batch_gnn_epochs", 40))
+
+            def _gnn_progress(epoch, loss):
+                frac = 0.90 + (epoch / max(epochs, 1)) * 0.05
+                progress_bar.progress(min(frac, 0.95))
+                if epoch % 10 == 0:
+                    with status:
+                        st.write(f"Epoch {epoch}/{epochs} | Loss: {loss:.4f}")
+
+            gnn_model, final_emb, adj_indices, adj_values = train_gnn(
+                node_features, merged, concept_to_id,
+                pos_pairs, neg_pairs, _gnn_progress, epochs=epochs,
             )
-        top_scores = compute_research_direction_scores(
-            gnn_model, node_features, final_emb, merged,
-            valid_concepts, concept_properties, ridge, embed_model,
-        )
-        del X_feat, y_target, node_features
-        gc.collect()
+            del pos_pairs, neg_pairs, adj_indices, adj_values
+            gc.collect()
+
+            with status:
+                st.write("🎯 Scoring research directions...")
+            X_feat: List[List[float]] = []
+            y_target: List[float] = []
+            for u, v in merged.edges():
+                pu = concept_properties.get(u, 0)
+                pv = concept_properties.get(v, 0)
+                w = merged[u][v].get('weight', 1)
+                X_feat.append([pu, pv, w])
+                y_target.append(
+                    max(pu, pv) * 1.08 if max(pu, pv) > 0 else 0
+                )
+            ridge = None
+            if len(X_feat) > 5:
+                ridge = Ridge(alpha=1.0).fit(
+                    np.array(X_feat), np.array(y_target)
+                )
+            top_scores = compute_research_direction_scores(
+                gnn_model, node_features, final_emb, merged,
+                valid_concepts, concept_properties, ridge, embed_model,
+            )
+            del X_feat, y_target
+            if node_features is not None:
+                del node_features
+            gc.collect()
 
         with status:
             st.write("🧪 Distillation + advanced analytics...")
@@ -7223,6 +7271,12 @@ def render_sidebar() -> None:
                     st.write(sorted(whitelist))
             else:
                 st.info("Ask a question in the 🤖 LLM-Guided Q&A tab to generate a whitelist.")
+        st.checkbox(
+            "⚡ Quick Build Mode (skip GNN & semantic edges)",
+            value=False,
+            key="quick_build_mode",
+            help="For query-focused builds: skip expensive GNN training and semantic edge computation. Uses only co-occurrence and ontology edges.",
+        )
         theme = THEME_PRESETS[st.session_state['theme']]
         st.subheader("⚡ Thermoelectric Focus Areas")
         st.markdown("- **Materials:** Bi₂Te₃, PbTe, SnSe, Mg₂Si, Skutterudites, Half-Heuslers, Cu₂Se, GeTe, AgSbTe₂, ZnO, SiGe")
@@ -7915,7 +7969,7 @@ def main() -> None:
                     metrics = extract_doc_metrics(text)
                     return idx, concepts, metrics
 
-                with ThreadPoolExecutor(max_workers=2) as executor:
+                with ThreadPoolExecutor(max_workers=4) as executor:
                     futures = {
                         executor.submit(_process_single_row, idx, row, whitelist): idx
                         for idx, row in df_filtered.iterrows()
@@ -7934,8 +7988,6 @@ def main() -> None:
                             status.write(
                                 f"Extracted {completed}/{total} documents..."
                             )
-                        if completed % 50 == 0:
-                            time.sleep(0.01)
 
                 all_concepts = [
                     c if c is not None else [] for c in all_concepts
@@ -8046,7 +8098,6 @@ def main() -> None:
                 gnn_model, final_emb, adj_indices, adj_values = train_gnn(
                     node_features, nx_graph, concept_to_id,
                     pos_pairs, neg_pairs, training_progress,
-                    epochs=15,
                 )
                 st.success("GNN training complete")
                 progress_bar.progress(0.80)
