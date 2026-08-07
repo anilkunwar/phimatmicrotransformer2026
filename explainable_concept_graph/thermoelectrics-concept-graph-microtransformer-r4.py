@@ -50,6 +50,7 @@ import re
 import json
 import math
 import os
+import pickle
 import sys
 import tempfile
 import warnings
@@ -160,6 +161,123 @@ st.set_page_config(
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 JSON_METADATA_DIR = os.path.join(SCRIPT_DIR, "json_metadatabase")
 os.makedirs(JSON_METADATA_DIR, exist_ok=True)
+
+# ============================================================================
+# MEMORY-ISOLATION CACHE HELPERS (LLM <-> Graph)
+# ============================================================================
+LLM_CACHE_FILE = Path(SCRIPT_DIR) / "_llm_query_cache.json"
+ANALYSIS_LIGHT_FILE = Path(SCRIPT_DIR) / "_analysis_light.pkl"
+ANALYSIS_TORCH_FILE = Path(SCRIPT_DIR) / "_analysis_torch.pt"
+ANALYSIS_STATE_FILE = Path(SCRIPT_DIR) / "_analysis_state.json"
+
+
+def save_llm_query_to_cache(analysis, ontology, expander) -> None:
+    """Saves the LLM analysis result and expanded ontology to a temporary JSON file."""
+    cache_data = {
+        "query": analysis.original_query,
+        "whitelist": list(set(analysis.explicitly_mentioned) | set(analysis.inferred_concepts)),
+        "dynamic_concepts": list(expander.session_concepts_added),
+        "bridge_concepts": dict(expander.query_bridge_concepts),
+        "expanded_ontology": {
+            "concepts": {
+                k: {
+                    "canonical_name": v.canonical_name,
+                    "concept_type": v.concept_type.value,
+                    "synonyms": list(v.synonyms),
+                    "hypernyms": list(v.hypernyms),
+                    "hyponyms": list(v.hyponyms),
+                    "definition": v.definition,
+                } for k, v in ontology.concepts.items()
+            },
+            "relationships": [
+                {"source": r.source, "target": r.target, "rel_type": r.rel_type.value, "confidence": r.confidence}
+                for r in ontology.relationships
+            ]
+        }
+    }
+    with open(LLM_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache_data, f, indent=2)
+
+
+def load_llm_query_from_cache():
+    """Loads the LLM analysis from cache if it exists."""
+    if LLM_CACHE_FILE.exists():
+        try:
+            with open(LLM_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def clear_llm_query_cache() -> None:
+    """Deletes the temporary LLM cache file."""
+    if LLM_CACHE_FILE.exists():
+        LLM_CACHE_FILE.unlink()
+
+
+def save_analysis_to_cache(analysis_data: dict) -> bool:
+    """Offloads heavy analysis objects to disk so the LLM can be loaded safely."""
+    try:
+        # Lightweight payload: everything needed for Q&A subgraph extraction
+        light_payload = {
+            "nx_graph": analysis_data["nx_graph"],
+            "concept_abstract_map": analysis_data["concept_abstract_map"],
+            "valid_concepts": analysis_data["valid_concepts"],
+            "concept_to_id": analysis_data["concept_to_id"],
+            "id_to_concept": analysis_data["id_to_concept"],
+            "all_texts": analysis_data.get("all_texts", []),
+            "selected_text_cols": analysis_data.get("selected_text_cols", []),
+            "concept_properties": analysis_data.get("concept_properties", {}),
+        }
+        with open(ANALYSIS_LIGHT_FILE, "wb") as f:
+            pickle.dump(light_payload, f)
+
+        # Heavy payload: large DataFrames, torch tensors, models
+        heavy_payload = {
+            "ridge": analysis_data.get("ridge"),
+            "top_scores": analysis_data.get("top_scores"),
+            "distill_df": analysis_data.get("distill_df"),
+            "gnn_model": analysis_data.get("gnn_model"),
+            "final_emb": analysis_data.get("final_emb"),
+            "all_metrics": analysis_data.get("all_metrics", []),
+            "config": analysis_data.get("config", {}),
+            "df_filtered": analysis_data.get("df_filtered"),
+            "reasoning_paths": analysis_data.get("reasoning_paths", []),
+        }
+        torch.save(heavy_payload, ANALYSIS_TORCH_FILE)
+
+        state = {"offloaded": True, "timestamp": datetime.now().isoformat()}
+        with open(ANALYSIS_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        return True
+    except Exception as e:
+        st.error(f"Failed to save analysis cache: {e}")
+        return False
+
+
+def load_analysis_from_cache(light_only: bool = False):
+    """Reloads analysis objects from disk."""
+    result = {}
+    try:
+        if ANALYSIS_LIGHT_FILE.exists():
+            with open(ANALYSIS_LIGHT_FILE, "rb") as f:
+                result.update(pickle.load(f))
+        if not light_only and ANALYSIS_TORCH_FILE.exists():
+            heavy = torch.load(ANALYSIS_TORCH_FILE, map_location="cpu")
+            result.update(heavy)
+        return result if result else None
+    except Exception as e:
+        st.error(f"Failed to load analysis cache: {e}")
+        return None
+
+
+def clear_analysis_cache() -> None:
+    """Removes all analysis cache files."""
+    for p in [ANALYSIS_LIGHT_FILE, ANALYSIS_TORCH_FILE, ANALYSIS_STATE_FILE]:
+        if p.exists():
+            p.unlink()
+    st.session_state.pop("analysis_offloaded", None)
 
 
 # ============================================================================
@@ -7810,6 +7928,44 @@ def main() -> None:
         st.error("Please select at least one text column.")
         return
 
+    # --- LOAD LLM CACHE IF EXISTS (Phase 1 -> Phase 2 handoff) ---
+    cached_llm_data = load_llm_query_from_cache()
+    if cached_llm_data:
+        if 'last_query_whitelist' not in st.session_state or not st.session_state.get('last_query_whitelist'):
+            st.session_state['last_query_whitelist'] = set(cached_llm_data["whitelist"])
+            st.session_state['last_query_dynamic_concepts'] = set(cached_llm_data["dynamic_concepts"])
+            st.session_state['last_query_bridge_concepts'] = cached_llm_data["bridge_concepts"]
+
+            # Rebuild ontology if it doesn't have the mutations
+            if len(st.session_state.ontology.concepts) != len(cached_llm_data["expanded_ontology"]["concepts"]):
+                ontology = st.session_state.ontology
+                ontology.concepts = {}
+                for name, data in cached_llm_data["expanded_ontology"]["concepts"].items():
+                    ontology.concepts[name] = ConceptNode(
+                        canonical_name=data["canonical_name"],
+                        concept_type=ConceptType(data["concept_type"]),
+                        synonyms=set(data["synonyms"]),
+                        hypernyms=set(data["hypernyms"]),
+                        hyponyms=set(data["hyponyms"]),
+                        definition=data["definition"]
+                    )
+                ontology.relationships = [
+                    Relationship(source=r["source"], target=r["target"],
+                                 rel_type=RelationshipType(r["rel_type"]), confidence=r["confidence"])
+                    for r in cached_llm_data["expanded_ontology"]["relationships"]
+                ]
+                ontology._build_synonym_index()
+                st.info("ℹ️ Loaded expanded ontology from temporary LLM cache.")
+
+    # Add a button to clear the cache
+    if cached_llm_data:
+        if st.button("🗑️ Clear LLM Query Cache & Use Default Ontology"):
+            clear_llm_query_cache()
+            st.session_state.pop('last_query_whitelist', None)
+            st.session_state.ontology = DomainOntology()  # Reset to base
+            st.session_state.qa_expander = DynamicOntologyExpander(st.session_state.ontology)
+            st.rerun()
+
     # --- RUN ANALYSIS ---
     build_clicked = st.button(
         "🚀 Build Concept Graph with Reasoning",
@@ -8749,8 +8905,10 @@ def main() -> None:
         # LLM-Guided Q&A Tab
         tab_idx += 1
         with tabs[tab_idx]:
-            if st.session_state.analysis_data is not None and "ontology" in st.session_state.analysis_data:
-                render_llm_qa_tab(st.session_state.analysis_data, st.session_state.analysis_data["ontology"])
+            qa_data = st.session_state.analysis_data
+            ontology_for_qa = st.session_state.get("ontology")
+            if qa_data is not None and ontology_for_qa is not None:
+                render_llm_qa_tab(qa_data, ontology_for_qa)
             else:
                 st.info("Please build the concept graph with ontology enabled first.")
 
