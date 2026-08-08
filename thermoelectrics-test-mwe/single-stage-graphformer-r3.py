@@ -2849,42 +2849,49 @@ class LatentMoEKGExtractor(nn.Module):
 
     def forward(self, node_seq, edge_seq):
         # node_seq: (batch, seq_len), edge_seq: (batch, seq_len - 1)
-        node_emb = self.node_embedding(node_seq)
+        node_emb = self.node_embedding(node_seq)          # (batch, seq_len, d_model)
 
         if edge_seq.size(1) > 0:
-            edge_emb = self.edge_embedding(edge_seq)
+            edge_emb = self.edge_embedding(edge_seq)      # (batch, seq_len-1, d_model)
             node_emb[:, 1:, :] = node_emb[:, 1:, :] + edge_emb
 
-        # 1. Down-projection to latent space
-        latent_repr = self.down_proj(node_emb)
+        batch_size, seq_len, d_model = node_emb.shape
 
-        # 2. Routing
-        router_logits = self.router(latent_repr)
-        routing_weights = F.softmax(router_logits, dim=-1)
+        # 1. Down‑project to latent space
+        latent_repr = self.down_proj(node_emb)            # (batch, seq_len, latent_dim)
+
+        # Flatten for per‑token routing
+        flat_latent = latent_repr.view(batch_size * seq_len, -1)  # (N, latent_dim)
+
+        # 2. Routing: compute softmax over experts for each token
+        router_logits = self.router(flat_latent)          # (N, n_experts)
+        routing_weights = F.softmax(router_logits, dim=-1) # (N, n_experts)
         topk_weights, topk_indices = torch.topk(routing_weights, self.top_k, dim=-1)
         topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-6)
 
-        # 3. Vectorized Expert Computation
-        expert_outputs = torch.stack([exp(latent_repr) for exp in self.experts], dim=0)
-        moe_output = torch.zeros_like(latent_repr)
+        # 3. Compute expert outputs for all tokens
+        # Stack all experts' outputs: (n_experts, N, latent_dim)
+        expert_outputs = torch.stack([self.experts[i](flat_latent) for i in range(self.n_experts)], dim=0)
 
-        batch_size, seq_len, _ = latent_repr.shape
-        b_idx = torch.arange(batch_size, device=latent_repr.device).unsqueeze(1).expand(batch_size, seq_len)
-        s_idx = torch.arange(seq_len, device=latent_repr.device).unsqueeze(0).expand(batch_size, seq_len)
+        # Gather the top‑k experts' outputs for each token
+        # Use advanced indexing: expert_outputs[expert_idx, token_idx, :]
+        token_indices = torch.arange(batch_size * seq_len, device=flat_latent.device).unsqueeze(1).expand(-1, self.top_k)
+        selected = expert_outputs[topk_indices, token_indices, :]   # (N, top_k, latent_dim)
 
-        for k in range(self.top_k):
-            idx = topk_indices[..., k]
-            w = topk_weights[..., k].unsqueeze(-1)
-            selected = expert_outputs[idx, b_idx, s_idx, :]
-            moe_output += w * selected
+        # Weighted sum over top‑k experts
+        weighted = topk_weights.unsqueeze(-1) * selected            # (N, top_k, latent_dim)
+        moe_output_flat = weighted.sum(dim=1)                       # (N, latent_dim)
 
-        # 4. Up-projection and Residual
-        node_emb = node_emb + self.up_proj(moe_output)
+        # Reshape back to (batch, seq_len, latent_dim)
+        moe_output = moe_output_flat.view(batch_size, seq_len, -1)
 
-        # 5. Transformer Contextualization
+        # 4. Up‑project and add residual
+        node_emb = node_emb + self.up_proj(moe_output)   # (batch, seq_len, d_model)
+
+        # 5. Transformer contextualization
         out = self.transformer(node_emb)
         out = self.output_proj(out)
-        return out, routing_weights
+        return out, routing_weights.view(batch_size, seq_len, -1)  # return routing_weights reshaped
 
 
 # ============================================================================
