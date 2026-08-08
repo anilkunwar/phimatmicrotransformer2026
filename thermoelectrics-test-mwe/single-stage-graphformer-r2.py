@@ -7448,7 +7448,7 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
                f"{sum(1 for n in ontology.concepts.values() if n.concept_type == ConceptType.MATERIAL)} materials, "
                f"{sum(1 for n in ontology.concepts.values() if n.concept_type == ConceptType.PROPERTY)} properties.")
 
-kg_model = LatentMoEKGExtractor(num_nodes, NUM_EDGE_TYPES)
+    kg_model = LatentMoEKGExtractor(num_nodes, NUM_EDGE_TYPES)
     kg_model.eval()
 
     st.markdown("---")
