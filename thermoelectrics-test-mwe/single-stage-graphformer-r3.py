@@ -2831,8 +2831,6 @@ class LatentMoEKGExtractor(nn.Module):
         # Latent MoE Components
         self.down_proj = nn.Linear(d_model, latent_dim, bias=False)
         self.up_proj = nn.Linear(latent_dim, d_model, bias=False)
-        # Weight tying to prevent rank collapse and save parameters
-        self.up_proj.weight = self.down_proj.weight 
 
         self.router = nn.Linear(latent_dim, n_experts)
         self.experts = nn.ModuleList([nn.Linear(latent_dim, latent_dim) for _ in range(n_experts)])
