@@ -7383,6 +7383,27 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
     concept_to_id = analysis_data["concept_to_id"]
     num_nodes = len(concept_to_id)
 
+    # --- FALLBACK LOGIC START ---
+    graph_materials = [c for c in concept_to_id if ontology.get_concept_type(c) == ConceptType.MATERIAL]
+    graph_properties = [c for c in concept_to_id if ontology.get_concept_type(c) == ConceptType.PROPERTY]
+
+    if not graph_materials:
+        material_nodes = [c for c in ontology.concepts if ontology.concepts[c].concept_type == ConceptType.MATERIAL]
+        st.warning("⚠️ No MATERIAL nodes in the graph. Using ontology‑defined materials (path inference may be unavailable).")
+    else:
+        material_nodes = graph_materials
+
+    if not graph_properties:
+        property_nodes = [c for c in ontology.concepts if ontology.concepts[c].concept_type == ConceptType.PROPERTY]
+        st.warning("⚠️ No PROPERTY nodes in the graph. Using ontology‑defined properties (path inference may be unavailable).")
+    else:
+        property_nodes = graph_properties
+
+    if not material_nodes or not property_nodes:
+        st.info("No materials or properties are defined in the ontology. Please check the DomainOntology.")
+        return
+    # --- FALLBACK LOGIC END ---
+
     # Instantiate the model
     kg_model = LatentMoEKGExtractor(num_nodes, NUM_EDGE_TYPES)
     kg_model.eval()
@@ -7390,10 +7411,6 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
     st.markdown("---")
     st.markdown("#### 🔬 Expert Routing Activation Analysis")
     st.write("Select a reasoning path from the Knowledge Graph to see how the Microtransformer routes the concepts through the 32 latent experts.")
-
-    # Get a list of paths from the ontology
-    material_nodes = [c for c in concept_to_id if ontology.get_concept_type(c) == ConceptType.MATERIAL]
-    property_nodes = [c for c in concept_to_id if ontology.get_concept_type(c) == ConceptType.PROPERTY]
 
     col1, col2 = st.columns(2)
     with col1:
@@ -7403,7 +7420,15 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
 
     if st.button("⚡ Run LatentMoE Inference on Path", type="primary"):
         if selected_mat and selected_prop:
-            paths = ontology.infer_path(selected_mat, selected_prop, max_depth=3)
+            # Try to find path in graph if both nodes exist; otherwise use ontology path
+            if selected_mat in nx_graph and selected_prop in nx_graph:
+                paths = ontology.infer_path(selected_mat, selected_prop, max_depth=3)
+            else:
+                # Fallback: use ontology path even if nodes not in graph
+                paths = ontology.infer_path(selected_mat, selected_prop, max_depth=3)
+                if paths:
+                    st.info("Path found in ontology, but one or both nodes are not in the graph. The microtransformer will still process the sequence using node IDs (fallback to 0 for missing nodes).")
+
             if paths:
                 path = paths[0]
                 st.success(f"Processing Path: {' → '.join(path)}")
@@ -7414,13 +7439,18 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
 
                 edge_indices = []
                 for i in range(len(path)-1):
-                    # Find edge type in networkx graph
+                    # Find edge type in networkx graph (or fallback to semantic)
                     edge_data = nx_graph.get_edge_data(path[i], path[i+1])
                     if edge_data:
                         rel_str = edge_data.get('edge_type', 'semantic').upper()
                         edge_indices.append(RELATIONSHIP_TO_IDX.get(rel_str, 0))
                     else:
-                        edge_indices.append(0)
+                        # If edge missing in graph, try ontology relationship
+                        rel = next((r for r in ontology.relationships if r.source == path[i] and r.target == path[i+1]), None)
+                        if rel:
+                            edge_indices.append(RELATIONSHIP_TO_IDX.get(rel.rel_type.name, 0))
+                        else:
+                            edge_indices.append(0)
 
                 edge_seq = torch.tensor([edge_indices], dtype=torch.long)
 
@@ -7453,6 +7483,8 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
                     cols[i].metric(label=row["Expert Domain"], value=f"{row['Activation Weight']:.3f}")
             else:
                 st.warning("No inference path found between selected nodes.")
+        else:
+            st.warning("Please select both a source material and a target property.")
 
     st.markdown("---")
     st.markdown("#### 📤 Edge Deployment (Ubuntu/Lubuntu ONNX Export)")
