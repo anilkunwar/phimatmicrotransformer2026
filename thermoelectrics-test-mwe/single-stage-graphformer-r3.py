@@ -7463,69 +7463,77 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
 
     if st.button("⚡ Run LatentMoE Inference on Path", type="primary"):
         if selected_mat and selected_prop:
-            # Try to find path in graph if both nodes exist; otherwise use ontology path
+            path = None
+
+            # 1. Try to find a path in the graph (contains inferred bridges)
             if selected_mat in nx_graph and selected_prop in nx_graph:
-                paths = ontology.infer_path(selected_mat, selected_prop, max_depth=3)
-            else:
-                # Fallback: use ontology path even if nodes not in graph
-                paths = ontology.infer_path(selected_mat, selected_prop, max_depth=3)
-                if paths:
-                    st.info("Path found in ontology, but one or both nodes are not in the graph. The microtransformer will still process the sequence using node IDs (fallback to 0 for missing nodes).")
+                try:
+                    path = nx.shortest_path(nx_graph, source=selected_mat, target=selected_prop)
+                    st.success(f"Path found in graph: {' → '.join(path)}")
+                except nx.NetworkXNoPath:
+                    pass
 
-            if paths:
-                path = paths[0]
-                st.success(f"Processing Path: {' → '.join(path)}")
+            # 2. Fallback to ontology if graph path missing
+            if path is None:
+                ontology_paths = ontology.infer_path(selected_mat, selected_prop, max_depth=3)
+                if ontology_paths:
+                    path = ontology_paths[0]
+                    st.info("Path found in ontology (graph path not available).")
+                else:
+                    st.warning("No inference path found between selected nodes.")
+                    return
 
-                # Tokenize path for Transformer (node_seq, edge_seq)
-                node_indices = [concept_to_id.get(n, 0) for n in path]
-                node_seq = torch.tensor([node_indices], dtype=torch.long)
+            # Proceed with tokenization and model inference
+            st.success(f"Processing Path: {' → '.join(path)}")
 
-                edge_indices = []
-                for i in range(len(path)-1):
-                    # Find edge type in networkx graph (or fallback to semantic)
-                    edge_data = nx_graph.get_edge_data(path[i], path[i+1])
-                    if edge_data:
-                        rel_str = edge_data.get('edge_type', 'semantic').upper()
-                        edge_indices.append(RELATIONSHIP_TO_IDX.get(rel_str, 0))
+            # Tokenize path for Transformer (node_seq, edge_seq)
+            node_indices = [concept_to_id.get(n, 0) for n in path]
+            node_seq = torch.tensor([node_indices], dtype=torch.long)
+
+            edge_indices = []
+            for i in range(len(path)-1):
+                # Get edge data from graph (if edge exists), else fallback to ontology
+                edge_data = nx_graph.get_edge_data(path[i], path[i+1])
+                if edge_data:
+                    rel_str = edge_data.get('edge_type', 'semantic').upper()
+                    edge_indices.append(RELATIONSHIP_TO_IDX.get(rel_str, 0))
+                else:
+                    # Try ontology relationship
+                    rel = next((r for r in ontology.relationships if r.source == path[i] and r.target == path[i+1]), None)
+                    if rel:
+                        edge_indices.append(RELATIONSHIP_TO_IDX.get(rel.rel_type.name, 0))
                     else:
-                        # If edge missing in graph, try ontology relationship
-                        rel = next((r for r in ontology.relationships if r.source == path[i] and r.target == path[i+1]), None)
-                        if rel:
-                            edge_indices.append(RELATIONSHIP_TO_IDX.get(rel.rel_type.name, 0))
-                        else:
-                            edge_indices.append(0)
+                        edge_indices.append(0)  # fallback
 
-                edge_seq = torch.tensor([edge_indices], dtype=torch.long)
+            edge_seq = torch.tensor([edge_indices], dtype=torch.long)
 
-                # Run forward pass
-                with torch.no_grad():
-                    out, routing_weights = kg_model(node_seq, edge_seq)
+            # Run forward pass
+            with torch.no_grad():
+                out, routing_weights = kg_model(node_seq, edge_seq)
 
-                # routing_weights shape: (1, seq_len, 32)
-                avg_weights = routing_weights.mean(dim=1).squeeze(0).numpy()
+            # routing_weights shape: (1, seq_len, 32)
+            avg_weights = routing_weights.mean(dim=1).squeeze(0).numpy()
 
-                # Plot Expert Activation
-                df_experts = pd.DataFrame({
-                    "Expert Domain": TE_EXPERT_LABELS,
-                    "Activation Weight": avg_weights
-                }).sort_values("Activation Weight", ascending=False)
+            # Plot Expert Activation
+            df_experts = pd.DataFrame({
+                "Expert Domain": TE_EXPERT_LABELS,
+                "Activation Weight": avg_weights
+            }).sort_values("Activation Weight", ascending=False)
 
-                fig = px.bar(
-                    df_experts, x="Expert Domain", y="Activation Weight",
-                    title="LatentMoE Expert Routing Activation (Averaged over Path)",
-                    color="Activation Weight",
-                    color_continuous_scale="Viridis"
-                )
-                fig.update_layout(xaxis_tickangle=-45, height=500)
-                st.plotly_chart(fig, use_container_width=True)
+            fig = px.bar(
+                df_experts, x="Expert Domain", y="Activation Weight",
+                title="LatentMoE Expert Routing Activation (Averaged over Path)",
+                color="Activation Weight",
+                color_continuous_scale="Viridis"
+            )
+            fig.update_layout(xaxis_tickangle=-45, height=500)
+            st.plotly_chart(fig, use_container_width=True)
 
-                st.markdown("**Top Activated Experts:**")
-                top_experts = df_experts.head(4)
-                cols = st.columns(4)
-                for i, (_, row) in enumerate(top_experts.iterrows()):
-                    cols[i].metric(label=row["Expert Domain"], value=f"{row['Activation Weight']:.3f}")
-            else:
-                st.warning("No inference path found between selected nodes.")
+            st.markdown("**Top Activated Experts:**")
+            top_experts = df_experts.head(4)
+            cols = st.columns(4)
+            for i, (_, row) in enumerate(top_experts.iterrows()):
+                cols[i].metric(label=row["Expert Domain"], value=f"{row['Activation Weight']:.3f}")
         else:
             st.warning("Please select both a source material and a target property.")
 
