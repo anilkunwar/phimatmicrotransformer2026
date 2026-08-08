@@ -8212,8 +8212,8 @@ def main() -> None:
                         if col in row and pd.notna(row[col])
                     ])
                     concepts = extractor.extract_from_text(text, idx, allowed_concepts=allowed_concepts)
-                    metrics = extract_doc_metrics(text)
-                    return idx, concepts, metrics
+                    doc_metrics = extract_doc_metrics(text)
+                    return idx, concepts, doc_metrics
 
                 with ThreadPoolExecutor(max_workers=2) as executor:
                     futures = {
@@ -8223,9 +8223,9 @@ def main() -> None:
                     completed = 0
                     total = len(futures)
                     for future in as_completed(futures):
-                        idx, concepts, metrics = future.result()
+                        idx, concepts, doc_metrics = future.result()
                         all_concepts[idx] = concepts
-                        all_metrics[idx] = metrics
+                        all_metrics[idx] = doc_metrics
                         completed += 1
                         if completed % 10 == 0 or completed == total:
                             progress_bar.progress(
