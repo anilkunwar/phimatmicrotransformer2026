@@ -1207,6 +1207,26 @@ class DomainOntology:
         return related
 
 
+
+# ============================================================================
+# ONTOLOGY SAFETY HELPER
+# ============================================================================
+
+def ensure_ontology_populated() -> "DomainOntology":
+    """
+    Returns a fully populated DomainOntology instance, re‑initialising it if necessary.
+    """
+    if "ontology" not in st.session_state or not st.session_state.ontology.concepts:
+        st.session_state.ontology = DomainOntology()
+    # Double‑check that we have at least one material and one property
+    ontology = st.session_state.ontology
+    has_material = any(node.concept_type == ConceptType.MATERIAL for node in ontology.concepts.values())
+    has_property = any(node.concept_type == ConceptType.PROPERTY for node in ontology.concepts.values())
+    if not has_material or not has_property:
+        # Force rebuild (should not normally happen)
+        st.session_state.ontology = DomainOntology()
+    return st.session_state.ontology
+
 # ============================================================================
 # ADVANCED CONCEPT RESOLVER (unchanged)
 # ============================================================================
@@ -7379,14 +7399,17 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
         st.info("Please build the concept graph first.")
         return
 
+    # --- 1. Ensure ontology is valid ---
+    ontology = ensure_ontology_populated()  # <-- use helper
     nx_graph = analysis_data["nx_graph"]
     concept_to_id = analysis_data["concept_to_id"]
     num_nodes = len(concept_to_id)
 
-    # --- FALLBACK LOGIC START ---
+    # --- 2. Get material and property nodes from graph, fallback to ontology, then hardcoded ---
     graph_materials = [c for c in concept_to_id if ontology.get_concept_type(c) == ConceptType.MATERIAL]
     graph_properties = [c for c in concept_to_id if ontology.get_concept_type(c) == ConceptType.PROPERTY]
 
+    # Fallback to ontology concepts if graph lacks them
     if not graph_materials:
         material_nodes = [c for c in ontology.concepts if ontology.concepts[c].concept_type == ConceptType.MATERIAL]
         st.warning("⚠️ No MATERIAL nodes in the graph. Using ontology‑defined materials (path inference may be unavailable).")
@@ -7399,13 +7422,33 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
     else:
         property_nodes = graph_properties
 
-    if not material_nodes or not property_nodes:
-        st.info("No materials or properties are defined in the ontology. Please check the DomainOntology.")
-        return
-    # --- FALLBACK LOGIC END ---
+    # --- 3. Last‑resort hardcoded lists (in case ontology is still empty) ---
+    if not material_nodes:
+        # Fallback to known materials from the ontology's _build_ontology (replicated here)
+        material_nodes = [
+            "bi2te3", "pbte", "snse", "mg2si", "skutterudite", "half_heusler",
+            "cu2se", "gete", "agsbte2", "zno", "sige"
+        ]
+        st.warning("⚠️ Using hardcoded material list as fallback.")
+    if not property_nodes:
+        property_nodes = [
+            "seebeck_coefficient", "electrical_conductivity", "thermal_conductivity",
+            "lattice_thermal_conductivity", "zt_figure_of_merit", "power_factor",
+            "carrier_concentration", "carrier_mobility", "band_gap"
+        ]
+        st.warning("⚠️ Using hardcoded property list as fallback.")
 
-    # Instantiate the model
-    kg_model = LatentMoEKGExtractor(num_nodes, NUM_EDGE_TYPES)
+    # If we still have nothing, show an error and return
+    if not material_nodes or not property_nodes:
+        st.error("No materials or properties available. Please check the ontology definition.")
+        return
+
+    # Optional diagnostic
+    st.caption(f"Ontology contains {len(ontology.concepts)} concepts: "
+               f"{sum(1 for n in ontology.concepts.values() if n.concept_type == ConceptType.MATERIAL)} materials, "
+               f"{sum(1 for n in ontology.concepts.values() if n.concept_type == ConceptType.PROPERTY)} properties.")
+
+kg_model = LatentMoEKGExtractor(num_nodes, NUM_EDGE_TYPES)
     kg_model.eval()
 
     st.markdown("---")
@@ -7525,6 +7568,9 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
                     )
             except Exception as e:
                 st.error(f"ONNX Export failed: {e}")
+
+
+
 
 
 # ============================================================================
