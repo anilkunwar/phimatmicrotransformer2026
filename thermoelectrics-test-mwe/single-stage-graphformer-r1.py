@@ -8588,11 +8588,11 @@ def main() -> None:
             elif nx_graph.number_of_edges() == 0:
                 st.error("🚨 CRITICAL: No edges found in concept graph. This means ZERO co-occurrences were extracted from your documents.")
                 st.info("The graph below is a **semantic fallback** (complete graph) — every node is artificially connected to every other node. This is NOT a real concept graph.")
-                st.markdown("**Likely causes:**
+                st.markdown("""**Likely causes:**
 1. Your documents don't contain the exact terminology the regex patterns expect (e.g., 'seebeck coefficient' vs 'Seebeck effect')
 2. Wrong text column selected
 3. Frequency threshold too high
-4. Batch size too large causing memory issues")
+4. Batch size too large causing memory issues""")
                 nx_graph = nx.complete_graph(len(valid_concepts))
                 nx_graph = nx.relabel_nodes(
                     nx_graph, {i: valid_concepts[i] for i in range(len(valid_concepts))}
