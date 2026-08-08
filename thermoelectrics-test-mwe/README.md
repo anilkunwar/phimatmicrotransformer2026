@@ -1,6 +1,6 @@
 # CSV to JSON
 
-[![integratedllmgraphte](https://img.shields.io/badge/thermoelectrics-v-brightgreen)](https://single-stage-graphformer.streamlit.app/) (Options of query-distilled concept graph and default entirety analysis concept graph, Customizable nodes in the Concept Graph)
+[![integratedllmgraphte](https://img.shields.io/badge/seebeckcsvtojson-v1-red)](https://ntseebeck-metadata-csvtojson1.streamlit.app/) (Options of query-distilled concept graph and default entirety analysis concept graph, Customizable nodes in the Concept Graph)
 
 # Single Stage Solution that Uses the Total RAM (N1 + N2 + N3)  Space Commonly i.e.  LLM-Guided Query + Concept Graph + Microtransformer 
 
