@@ -124,6 +124,247 @@ class PerformanceMonitor:
                 f"({count} calls, {avg_time:.4f}s avg)"
             )
         return "\n".join(report)
+# ============================================================================
+# RUNTIME COMPUTATIONAL METRICS LOGGER
+# ============================================================================
+class RunMetricsLogger:
+    """Central logger for runtime computational metrics (steps + resources)."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.start_wall = time.time()
+        self.steps: List[Dict[str, Any]] = []
+        self.resources: List[Dict[str, Any]] = []
+        self.counters: Dict[str, Any] = {}
+        self._step_open: Optional[Dict[str, Any]] = None
+
+    # ---- Step timing -------------------------------------------------
+    def start_step(self, name: str) -> None:
+        self._sample_resources(tag=name, phase="start")
+        self._step_open = {
+            "name": name, "start": time.perf_counter(),
+            "mem_start": get_memory_usage_mb(),
+            "wall_start": time.time(),
+        }
+
+    def end_step(self, extra: Optional[Dict[str, Any]] = None) -> None:
+        if not self._step_open:
+            return
+        s = self._step_open
+        elapsed = time.perf_counter() - s["start"]
+        mem = get_memory_usage_mb()
+        entry = {
+            "name": s["name"],
+            "duration_s": elapsed,
+            "mem_start_mb": s["mem_start"],
+            "mem_end_mb": mem,
+            "mem_delta_mb": mem - s["mem_start"],
+            "wall_clock": datetime.now().strftime("%H:%M:%S"),
+            "elapsed_total_s": time.time() - self.start_wall,
+        }
+        if extra:
+            entry["extra"] = extra
+        self.steps.append(entry)
+        self._sample_resources(tag=s["name"], phase="end")
+        self._step_open = None
+
+    # ---- Resource sampling ------------------------------------------
+    def _sample_resources(self, tag: str, phase: str = "") -> None:
+        self.resources.append({
+            "wall_clock": datetime.now().strftime("%H:%M:%S"),
+            "elapsed_s": time.time() - self.start_wall,
+            "rss_mb": get_memory_usage_mb(),
+            "threads": getattr(torch, "get_num_threads", lambda: 1)(),
+            "cuda": torch.cuda.is_available(),
+            "tag": f"{tag}:{phase}" if phase else tag,
+        })
+
+    # ---- Counters ----------------------------------------------------
+    def set(self, key: str, value: Any) -> None:
+        self.counters[key] = value
+
+    def add(self, key: str, value: int = 1) -> None:
+        self.counters[key] = self.counters.get(key, 0) + value
+
+    # ---- DataFrames --------------------------------------------------
+    def step_df(self) -> pd.DataFrame:
+        return pd.DataFrame(self.steps)
+
+    def resource_df(self) -> pd.DataFrame:
+        return pd.DataFrame(self.resources)
+
+    # ---- Summary / persistence --------------------------------------
+    def summary(self) -> Dict[str, Any]:
+        df = self.step_df()
+        total = float(df["duration_s"].sum()) if not df.empty else 0.0
+        peak = max((r["rss_mb"] for r in self.resources), default=get_memory_usage_mb())
+        return {
+            "run_id": self.run_id,
+            "total_duration_s": total,
+            "wall_clock_s": time.time() - self.start_wall,
+            "n_steps": len(self.steps),
+            "peak_memory_mb": peak,
+            "final_memory_mb": get_memory_usage_mb(),
+            "counters": dict(self.counters),
+            "function_timings": PerformanceMonitor.get_report(),
+        }
+
+    def save_log(self, folder: Optional[str] = None) -> str:
+        folder = folder or os.path.join(SCRIPT_DIR, "metrics_logs")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"run_metrics_{self.run_id}.json")
+        payload = {
+            "summary": self.summary(),
+            "steps": self.steps,
+            "resources": self.resources,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+        return path
+
+
+def get_metrics_logger() -> RunMetricsLogger:
+    if "metrics_logger" not in st.session_state:
+        st.session_state.metrics_logger = RunMetricsLogger()
+    return st.session_state.metrics_logger
+
+
+# ============================================================================
+# RUNTIME METRICS PANEL (live) + DASHBOARD (post-run)
+# ============================================================================
+def render_live_metrics_panel(metrics: RunMetricsLogger, container) -> None:
+    """Renders a live-updating metrics strip. Call after each pipeline step."""
+    with container.container():
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Steps completed", len(metrics.steps))
+        c2.metric("Total time", f"{time.time() - metrics.start_wall:.1f}s")
+        c3.metric("Memory (RSS)", f"{get_memory_usage_mb():.0f} MB")
+        df = metrics.step_df()
+        if not df.empty:
+            last = df.iloc[-1]
+            c4.metric("Last step", last["name"],
+                      delta=f"{last['duration_s']:.2f}s", delta_color="off")
+        with st.expander("📋 Live step table", expanded=False):
+            if not df.empty:
+                st.dataframe(
+                    df[["name", "duration_s", "mem_start_mb",
+                        "mem_end_mb", "mem_delta_mb", "wall_clock"]],
+                    use_container_width=True,
+                )
+        rdf = metrics.resource_df()
+        if len(rdf) > 1:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=rdf["elapsed_s"], y=rdf["rss_mb"],
+                mode="lines+markers", name="RSS Memory",
+                text=rdf["tag"], hovertemplate=(
+                    "<b>%{text}</b><br>Elapsed: %{x:.1f}s<br>Memory: %{y:.0f} MB"
+                    "<extra></extra>"
+                ),
+            ))
+            fig.update_layout(
+                height=220, margin=dict(l=10, r=10, t=30, b=10),
+                title="Memory timeline", xaxis_title="Elapsed (s)",
+                yaxis_title="MB",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def render_metrics_dashboard(metrics: RunMetricsLogger) -> None:
+    """Full post-run computational metrics dashboard."""
+    if not metrics.steps:
+        st.info("No metrics recorded yet — run an analysis first.")
+        return
+
+    df = metrics.step_df()
+    rdf = metrics.resource_df()
+    total = df["duration_s"].sum()
+    peak = rdf["rss_mb"].max() if not rdf.empty else get_memory_usage_mb()
+
+    # ---- KPI row ----
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Total runtime", f"{total:.2f} s")
+    k2.metric("Wall clock", f"{time.time() - metrics.start_wall:.2f} s")
+    k3.metric("Peak memory", f"{peak:.1f} MB")
+    k4.metric("Steps executed", len(df))
+    k5.metric("Avg step time", f"{df['duration_s'].mean():.2f} s")
+
+    # ---- Step breakdown bar chart ----
+    st.markdown("### ⏱️ Per-step duration")
+    step_fig = px.bar(
+        df.sort_values("duration_s", ascending=False),
+        x="duration_s", y="name", orientation="h",
+        color="duration_s", color_continuous_scale="Turbo",
+        text=df["duration_s"].map(lambda v: f"{v:.2f}s"),
+    )
+    step_fig.update_layout(height=max(300, 25 * len(df)), yaxis={'categoryorder': 'total ascending'})
+    st.plotly_chart(step_fig, use_container_width=True)
+
+    # ---- Duration share (sunburst/pie) ----
+    col_a, col_b = st.columns(2)
+    with col_a:
+        pie = px.pie(df, names="name", values="duration_s", hole=0.45,
+                     title="Share of total runtime")
+        st.plotly_chart(pie, use_container_width=True)
+    with col_b:
+        mem_fig = go.Figure()
+        mem_fig.add_trace(go.Bar(x=df["name"], y=df["mem_start_mb"],
+                                 name="Mem start", marker_color="#3b82f6"))
+        mem_fig.add_trace(go.Bar(x=df["name"], y=df["mem_end_mb"],
+                                 name="Mem end", marker_color="#ef4444"))
+        mem_fig.update_layout(title="Memory before/after each step (MB)",
+                              barmode="group", xaxis_tickangle=-45)
+        st.plotly_chart(mem_fig, use_container_width=True)
+
+    # ---- Memory timeline ----
+    if len(rdf) > 1:
+        st.markdown("### 💾 Resource timeline")
+        timeline = go.Figure()
+        timeline.add_trace(go.Scatter(
+            x=rdf["elapsed_s"], y=rdf["rss_mb"], mode="lines+markers",
+            name="RSS", text=rdf["tag"],
+            hovertemplate="<b>%{text}</b><br>%{x:.1f}s — %{y:.0f} MB<extra></extra>",
+        ))
+        timeline.update_layout(xaxis_title="Elapsed (s)", yaxis_title="MB", height=280)
+        st.plotly_chart(timeline, use_container_width=True)
+
+    # ---- Numeric tables ----
+    st.markdown("### 🔢 Numeric step log")
+    st.dataframe(df, use_container_width=True)
+    with st.expander("Raw resource samples"):
+        st.dataframe(rdf, use_container_width=True)
+
+    # ---- Counters + function-level timings ----
+    st.markdown("### 🧮 Pipeline counters")
+    if metrics.counters:
+        counter_df = pd.DataFrame(
+            list(metrics.counters.items()), columns=["Counter", "Value"]
+        )
+        st.dataframe(counter_df, use_container_width=True)
+    else:
+        st.info("No counters recorded.")
+
+    with st.expander("⚙️ Function-level timings (PerformanceMonitor)"):
+        st.code(PerformanceMonitor.get_report() or "No timing data.", language="text")
+
+    # ---- Export ----
+    st.markdown("### 📥 Save log")
+    if st.button("💾 Write metrics log to disk"):
+        path = metrics.save_log()
+        st.success(f"Log saved to `{path}`")
+    json_str = json.dumps(
+        {"summary": metrics.summary(), "steps": metrics.steps,
+         "resources": metrics.resources},
+        indent=2, default=str,
+    )
+    st.download_button("⬇️ Download metrics JSON", json_str.encode("utf-8"),
+                       file_name=f"run_metrics_{metrics.run_id}.json",
+                       mime="application/json")
+
+
 
 
 def timed(func):
@@ -735,6 +976,10 @@ class DomainOntology:
         self._add_concept("phonon_drag", ConceptType.PHENOMENON,
             synonyms={"phonon drag effect", "phonon drag thermopower"},
             definition="Phonon drag contribution to Seebeck coefficient at low temperatures.")
+        self._add_concept("nanotwin", ConceptType.MICROSTRUCTURE,
+            synonyms={"nanotwins", "twin boundary", "twin boundaries", "nanoscale twins", "twinning"},
+            definition="Nanoscale twin boundaries that introduce strain fields and selectively scatter phonons to reduce lattice thermal conductivity without severely degrading electrical conductivity.")
+
 
         # --- Parameters ---
         self._add_concept("temperature", ConceptType.PARAMETER,
@@ -839,6 +1084,10 @@ class DomainOntology:
             ("alloy_scattering", RelationshipType.CAUSES, "lattice_thermal_conductivity", -0.80),
             ("bipolar_effect", RelationshipType.CAUSES, "seebeck_coefficient", -0.65),  # reduces S at high T
             ("phonon_drag", RelationshipType.CAUSES, "seebeck_coefficient", 0.50),
+            # Nanotwin effects
+            ("nanotwin", RelationshipType.CAUSES, "phonon_scattering", 0.85),
+            ("nanotwin", RelationshipType.CAUSES, "lattice_thermal_conductivity", -0.85),
+            ("nanotwin", RelationshipType.INFLUENCES, "zt_figure_of_merit", 0.70),
             # Temperature → Properties
             ("temperature", RelationshipType.INFLUENCES, "seebeck_coefficient", 0.70),
             ("temperature", RelationshipType.INFLUENCES, "electrical_conductivity", -0.60),  # typically decreases
@@ -1409,6 +1658,10 @@ class EnhancedConceptExtractor:
             r'\balloy\s+scattering\b', r'\bbipolar\s+effect\b',
             r'\bphonon\s+drag\b'
         ]
+        self.microstructure_patterns = [
+            r'\bnanotwin[s]?\b', r'\btwin\s+boundar(?:y|ies)\b', r'\bnanoscale\s+twins\b'
+        ]
+
         self.param_patterns = [
             r'\btemperature\b', r'\bdoping\s+concentration\b',
             r'\bgrain\s+size\b', r'\bpressure\b', r'\bsintering\s+time\b',
@@ -5462,6 +5715,11 @@ def run_batch_analysis(
     run_mode: str = "all",
 ) -> None:
     overall_start = time.perf_counter()
+    metrics = get_metrics_logger()
+    metrics.reset()
+    metrics.set("total_docs", len(df_filtered))
+    metrics.set("mode", "batch")
+    live_panel = st.empty()
     # Force-clear any cached LLMs
     if 'qa_factory' in st.session_state:
         factory = st.session_state.qa_factory
@@ -5594,6 +5852,7 @@ def run_batch_analysis(
                 f"📦 Batch {batch_num + 1}/{total_batches} — "
                 f"docs {start}–{end - 1} ({n_this} docs)"
             )
+        metrics.start_step(f"Batch {batch_num+1}: NLP extraction")
         batch_concepts: List[List[str]] = []
         batch_metrics: List[Dict] = []
         batch_doc_freq: Dict[str, int] = defaultdict(int)
@@ -5638,6 +5897,8 @@ def run_batch_analysis(
             if (local_i + 1) % 50 == 0:
                 time.sleep(0.01)
 
+        metrics.end_step({"docs": n_this})
+        metrics.add("docs_extracted", n_this)
         bs["all_concepts"].extend(batch_concepts)
         bs["all_metrics"].extend(batch_metrics)
 
@@ -5668,6 +5929,7 @@ def run_batch_analysis(
         batch_valid = batch_valid[:top_n]
         concept_to_id_batch = {c: i for i, c in enumerate(batch_valid)}
 
+        metrics.start_step(f"Batch {batch_num+1}: graph build+merge")
         if use_ontology and bs["builder"] is not None:
             batch_graph = bs["builder"].build_batch_graph(
                 batch_concepts, batch_valid, concept_to_id_batch,
@@ -5684,6 +5946,13 @@ def run_batch_analysis(
         else:
             bs["merged_graph"] = merge_graphs(bs["merged_graph"], batch_graph)
         recompute_edge_weights(bs["merged_graph"], config)
+        metrics.end_step({
+            "nodes": bs["merged_graph"].number_of_nodes(),
+            "edges": bs["merged_graph"].number_of_edges(),
+        })
+        metrics.set("graph_nodes", bs["merged_graph"].number_of_nodes())
+        metrics.set("graph_edges", bs["merged_graph"].number_of_edges())
+        render_live_metrics_panel(metrics, live_panel)
         bs["next_batch"] = batch_num + 1
 
         bs["all_concepts"] = []
@@ -5709,6 +5978,7 @@ def run_batch_analysis(
             return
         min_freq = config.get("MIN_CONCEPT_FREQ", 2)
         top_n = config.get("TOP_N_CONCEPTS", 1000)
+        metrics.start_step("Finalize: embeddings")
         with status:
             st.write("🧩 Finalizing — selecting top concepts...")
 
@@ -5764,6 +6034,7 @@ def run_batch_analysis(
             del embeddings
         except Exception:
             node_features = torch.randn(len(valid_concepts), 384)
+        metrics.end_step({"n_concepts": len(valid_concepts)})
         gc.collect()
 
         with status:
@@ -5780,10 +6051,12 @@ def run_batch_analysis(
                 with status:
                     st.write(f"Epoch {epoch}/{epochs} | Loss: {loss:.4f}")
 
+        metrics.start_step("Finalize: GNN training")
         gnn_model, final_emb, adj_indices, adj_values = train_gnn(
             node_features, merged, concept_to_id,
             pos_pairs, neg_pairs, _gnn_progress, epochs=epochs,
         )
+        metrics.end_step({"epochs": epochs})
         del pos_pairs, neg_pairs, adj_indices, adj_values
         gc.collect()
 
@@ -5815,13 +6088,16 @@ def run_batch_analysis(
             ridge = Ridge(alpha=1.0).fit(
                 np.array(X_feat), np.array(y_target)
             )
+        metrics.start_step("Finalize: research scoring")
         top_scores = compute_research_direction_scores(
             gnn_model, node_features, final_emb, merged,
             valid_concepts, concept_properties, ridge, embed_model,
         )
+        metrics.end_step({"pairs_scored": len(top_scores)})
         del X_feat, y_target, node_features
         gc.collect()
 
+        metrics.start_step("Finalize: distillation+analytics")
         with status:
             st.write("🧪 Distillation + advanced analytics...")
         distill_df = compute_concept_distillation(
@@ -5856,6 +6132,7 @@ def run_batch_analysis(
         st.session_state.genealogy_df = genealogy_df
         st.session_state.bridge_df = bridge_df
         st.session_state.motifs = motifs
+        metrics.end_step()
         gc.collect()
 
         analysis_data = {
@@ -5916,6 +6193,9 @@ def run_batch_analysis(
             _finalize()
             total_time = time.perf_counter() - overall_start
             progress_bar.progress(1.0)
+            metrics.set("total_runtime_s", total_time)
+            log_path = metrics.save_log()
+            st.caption(f"📊 Metrics log saved: `{log_path}`")
             status.update(
                 label=(
                     f"Batch analysis complete! ({total_time:.1f}s, "
@@ -7705,6 +7985,17 @@ def render_sidebar() -> None:
         render_mutation_controls(expander)
         render_query_history()
 
+        st.markdown("---")
+        with st.expander("📊 Last run metrics"):
+            _m = st.session_state.get("metrics_logger")
+            if _m and _m.steps:
+                _s = _m.summary()
+                st.metric("Runtime", f"{_s['total_duration_s']:.1f}s")
+                st.metric("Peak RAM", f"{_s['peak_memory_mb']:.0f} MB")
+                st.metric("Steps", _s["n_steps"])
+            else:
+                st.caption("No run yet.")
+
 
 # ============================================================================
 # MAIN APPLICATION
@@ -7841,6 +8132,11 @@ def main() -> None:
             run_mode=(batch_trigger or "all"),
         )
     elif should_build:
+        metrics = get_metrics_logger()
+        metrics.reset()
+        metrics.set("mode", "standard")
+        metrics.set("total_docs", len(df_filtered))
+        live_panel = st.empty()
         progress_bar = st.progress(0.0)
         status = st.status(
             "Initializing advanced NLP analysis...", expanded=True,
@@ -7860,9 +8156,12 @@ def main() -> None:
                 st.write(f"Prepared {num_abstracts} documents")
                 progress_bar.progress(0.05)
 
+                metrics.start_step("Embedding model load")
                 st.write("Loading embedding model...")
                 embed_model = load_embedding_model()
+                metrics.end_step()
                 st.success("Embedding model loaded")
+                render_live_metrics_panel(metrics, live_panel)
                 progress_bar.progress(0.10)
 
                 config = get_adaptive_config(num_abstracts)
@@ -7902,6 +8201,7 @@ def main() -> None:
                     extractor = None
                 progress_bar.progress(0.20)
 
+                metrics.start_step("Concept extraction")
                 st.write("Extracting concepts from abstracts (Parallel)...")
                 all_concepts: List[Optional[List[str]]] = [None] * len(df_filtered)
                 all_metrics: List[Optional[Dict]] = [None] * len(df_filtered)
@@ -7968,8 +8268,11 @@ def main() -> None:
                         for c in set(concepts):
                             concept_abstract_map[c].append(doc_idx)
 
+                metrics.end_step({"concepts_found": len(valid_concepts)})
+                metrics.set("n_valid_concepts", len(valid_concepts))
                 st.write(f"✅ Extraction complete. Found {len(valid_concepts)} valid concepts.")
                 progress_bar.progress(0.35)
+                render_live_metrics_panel(metrics, live_panel)
 
                 valid_concepts = sorted(
                     valid_concepts,
@@ -7995,6 +8298,7 @@ def main() -> None:
                     )
                     return
 
+                metrics.start_step("Graph construction")
                 st.write("Building concept graph...")
                 if use_ontology and use_inference:
                     graph_builder = ReasoningEnhancedGraphBuilder(
@@ -8012,11 +8316,13 @@ def main() -> None:
                 pos_pairs, neg_pairs = sample_edges_for_training(
                     nx_graph, valid_concepts, concept_to_id, config,
                 )
+                metrics.end_step({"nodes": len(valid_concepts), "edges": nx_graph.number_of_edges()})
                 st.write(
                     f"Graph: {len(valid_concepts)} nodes, "
                     f"{nx_graph.number_of_edges()} edges"
                 )
                 progress_bar.progress(0.55)
+                render_live_metrics_panel(metrics, live_panel)
 
                 st.write("Generating node embeddings...")
                 try:
@@ -8033,6 +8339,7 @@ def main() -> None:
                 st.write(f"Node features: {node_features.shape}")
                 progress_bar.progress(0.65)
 
+                metrics.start_step("GNN training")
                 st.write("Training GraphSAGE...")
 
                 def training_progress(epoch, loss):
@@ -8048,9 +8355,12 @@ def main() -> None:
                     pos_pairs, neg_pairs, training_progress,
                     epochs=15,
                 )
+                metrics.end_step()
                 st.success("GNN training complete")
+                render_live_metrics_panel(metrics, live_panel)
                 progress_bar.progress(0.80)
 
+                metrics.start_step("Research direction scoring")
                 st.write("Scoring research directions...")
                 concept_properties: Dict[str, float] = {}
                 for concept in valid_concepts:
@@ -8084,9 +8394,11 @@ def main() -> None:
                     gnn_model, node_features, final_emb, nx_graph,
                     valid_concepts, concept_properties, ridge, embed_model,
                 )
+                metrics.end_step({"pairs_scored": len(top_scores)})
                 st.write(f"Scored {len(top_scores)} novel pairs")
                 progress_bar.progress(0.90)
 
+                metrics.start_step("Advanced analytics")
                 st.write("Computing distillation metrics...")
                 distill_df = compute_concept_distillation(
                     valid_concepts, concept_abstract_map, all_texts,
@@ -8114,8 +8426,12 @@ def main() -> None:
                 st.session_state.genealogy_df = genealogy_df
                 st.session_state.bridge_df = bridge_df
                 st.session_state.motifs = motifs
+                metrics.end_step()
 
                 total_time = time.perf_counter() - overall_start
+                metrics.set("total_runtime_s", total_time)
+                log_path = metrics.save_log()
+                st.caption(f"📊 Metrics log saved: `{log_path}`")
                 st.success(f"Analysis complete in {total_time:.1f}s!")
                 progress_bar.progress(1.00)
                 status.update(
@@ -8223,7 +8539,7 @@ def main() -> None:
         tab_names = [
             "📊 Visualization", "🧪 Distillation", "🎯 Research Directions",
             "✅ Validation", "📥 Export", "📈 Extra Viz",
-            "🔬 Advanced Analytics",
+            "🔬 Advanced Analytics", "📊 Computational Metrics",
         ]
         if has_reasoning:
             tab_names.append("🧠 Reasoning Dashboard")
@@ -8730,6 +9046,18 @@ def main() -> None:
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("No centrality data available.")
+
+        # Computational Metrics tab (always available post-build)
+        tab_idx += 1
+        with tabs[tab_idx]:
+            st.subheader("Computational Metrics")
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.caption("Run metrics recorded during the last analysis.")
+            with col2:
+                if st.button("🔄 Refresh metrics"):
+                    st.rerun()
+            render_metrics_dashboard(get_metrics_logger())
 
         if has_reasoning:
             tab_idx += 1
