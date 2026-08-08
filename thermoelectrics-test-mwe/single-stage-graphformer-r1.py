@@ -5374,13 +5374,24 @@ def render_reasoning_dashboard(nx_graph, valid_concepts, ontology, extractor) ->
         (u, v) for u, v, d in nx_graph.edges(data=True)
         if not d.get('inferred', False)
     ]
+    inf_ratio = len(inferred_edges) / max(len(observed_edges), 1)
     col1, col2, col3 = st.columns(3)
     col1.metric("Observed Edges", len(observed_edges))
     col2.metric("Inferred Edges", len(inferred_edges))
     col3.metric(
         "Inference Ratio",
-        f"{len(inferred_edges) / max(len(observed_edges), 1):.2f}",
+        f"{inf_ratio:.2f}",
     )
+    # --- Extraction Health Banner ---
+    if len(observed_edges) == 0:
+        st.error("🚨 EXTRACTION FAILURE: Zero observed edges. Your documents contributed nothing to this graph. The graph is 100% ontology-inferred.")
+    elif inf_ratio > 5.0:
+        st.warning(f"⚠️ EXTRACTION WEAK: Inference ratio is {inf_ratio:.1f}x. Only {len(observed_edges)} real edges vs {len(inferred_edges)} inferred. Most relationships are guesses, not evidence from your corpus.")
+    elif inf_ratio > 2.0:
+        st.info(f"ℹ️ Moderate inference ratio ({inf_ratio:.1f}x). Consider lowering frequency thresholds or checking text columns.")
+    else:
+        st.success(f"✅ Healthy extraction: {len(observed_edges)} observed edges, {len(inferred_edges)} inferred. Ratio: {inf_ratio:.1f}x")
+    # --- End Health Banner ---
     rel_types: Dict[str, int] = defaultdict(int)
     for u, v, d in nx_graph.edges(data=True):
         rel_types[d.get('edge_type', 'unknown')] += 1
@@ -5897,7 +5908,16 @@ def run_batch_analysis(
             if (local_i + 1) % 50 == 0:
                 time.sleep(0.01)
 
-        metrics.end_step({"docs": n_this})
+        # --- Batch Extraction Health Diagnostic ---
+        batch_total_mentions = sum(len(c) for c in batch_concepts)
+        if batch_total_mentions == 0:
+            st.warning(f"⚠️ Batch {batch_num+1}: ZERO concept mentions. Documents may not contain matching terminology.")
+        elif extractor is not None:
+            batch_freq = extractor.get_concept_frequencies()
+            batch_top = sorted(batch_freq.items(), key=lambda x: -x[1])[:5]
+            st.write(f"🔍 Batch {batch_num+1} top concepts: " + ", ".join([f"`{c}`({f})" for c,f in batch_top]))
+        # --- End Diagnostic ---
+        metrics.end_step({"docs": n_this, "batch_mentions": batch_total_mentions})
         metrics.add("docs_extracted", n_this)
         bs["all_concepts"].extend(batch_concepts)
         bs["all_metrics"].extend(batch_metrics)
@@ -8271,6 +8291,19 @@ def main() -> None:
                 metrics.end_step({"concepts_found": len(valid_concepts)})
                 metrics.set("n_valid_concepts", len(valid_concepts))
                 st.write(f"✅ Extraction complete. Found {len(valid_concepts)} valid concepts.")
+                # --- Extraction Health Diagnostic ---
+                if use_ontology and extractor is not None:
+                    total_mentions = sum(extractor.get_concept_frequencies().values())
+                    st.write(f"🔍 Total concept mentions across all docs: {total_mentions}")
+                    if total_mentions == 0:
+                        st.error("🚨 ZERO concept mentions extracted. Check text columns and extraction patterns.")
+                    elif total_mentions < len(df_filtered) * 2:
+                        st.warning("⚠️ Very few concept mentions. Graph will rely heavily on inferred edges.")
+                    top_extracted = sorted(extractor.get_concept_frequencies().items(), key=lambda x: -x[1])[:10]
+                    with st.expander("Top 10 extracted concepts (diagnostic)"):
+                        for concept, freq in top_extracted:
+                            st.write(f"  • `{concept}`: {freq} mentions")
+                # --- End Diagnostic ---
                 progress_bar.progress(0.35)
                 render_live_metrics_panel(metrics, live_panel)
 
@@ -8553,7 +8586,13 @@ def main() -> None:
             if nx_graph.number_of_nodes() == 0:
                 st.warning("No nodes to display.")
             elif nx_graph.number_of_edges() == 0:
-                st.warning("No edges - building semantic fallback")
+                st.error("🚨 CRITICAL: No edges found in concept graph. This means ZERO co-occurrences were extracted from your documents.")
+                st.info("The graph below is a **semantic fallback** (complete graph) — every node is artificially connected to every other node. This is NOT a real concept graph.")
+                st.markdown("**Likely causes:**
+1. Your documents don't contain the exact terminology the regex patterns expect (e.g., 'seebeck coefficient' vs 'Seebeck effect')
+2. Wrong text column selected
+3. Frequency threshold too high
+4. Batch size too large causing memory issues")
                 nx_graph = nx.complete_graph(len(valid_concepts))
                 nx_graph = nx.relabel_nodes(
                     nx_graph, {i: valid_concepts[i] for i in range(len(valid_concepts))}
