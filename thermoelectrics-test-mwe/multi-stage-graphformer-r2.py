@@ -2734,8 +2734,9 @@ class LatentMoEKGExtractor(nn.Module):
         # Latent MoE Components
         self.down_proj = nn.Linear(d_model, latent_dim, bias=False)
         self.up_proj = nn.Linear(latent_dim, d_model, bias=False)
-        # Weight tying to prevent rank collapse and save parameters
-        self.up_proj.weight = self.down_proj.weight 
+        # Weight tying via transpose so shapes match:
+        # down_proj weight is (latent_dim, d_model); up_proj needs (d_model, latent_dim)
+        self.up_proj.weight = nn.Parameter(self.down_proj.weight.T) 
 
         self.router = nn.Linear(latent_dim, n_experts)
         self.experts = nn.ModuleList([nn.Linear(latent_dim, latent_dim) for _ in range(n_experts)])
@@ -7407,6 +7408,34 @@ def render_llm_qa_tab(analysis_data: Dict, ontology: Any):
                     st.markdown("➕ Added Concept: `" + c['name'] + "` (" + c['type'] + ")")
                 for b in mutations.get("bridges_created", []):
                     st.markdown("🌉 Created Bridge: `" + b['bridge'] + "` for `" + b['for'] + "`")
+def plotly_continuous_scale(cmap_name: str) -> str:
+    """Map friendly colormap names to Plotly continuous colorscales."""
+    mapping = {
+        "viridis": "Viridis", "plasma": "Plasma", "inferno": "Inferno",
+        "magma": "Magma", "cividis": "Cividis", "turbo": "Turbo",
+        "jet": "Jet", "hot": "Hot", "cool": "Cool",
+        "spring": "Spring", "summer": "Summer", "autumn": "Autumn",
+        "winter": "Winter", "rdylgn": "RdYlGn", "rdylbu": "RdYlBu",
+        "spectral": "Spectral", "blues": "Blues", "reds": "Reds",
+        "greens": "Greens", "purples": "Purples",
+    }
+    return mapping.get(cmap_name.lower(), "Viridis")
+
+
+def apply_mt_chart_style(fig, theme: Dict[str, str]) -> go.Figure:
+    """Apply theme colors to a Plotly figure for consistent MT visualization."""
+    fig.update_layout(
+        paper_bgcolor=theme.get("bg_color", "#ffffff"),
+        plot_bgcolor=theme.get("card_bg", "#f8f9fa"),
+        font=dict(color=theme.get("text_color", "#212529")),
+        title_font=dict(color=theme.get("text_color", "#212529")),
+        legend=dict(
+            bgcolor=theme.get("card_bg", "#f8f9fa"),
+            font=dict(color=theme.get("text_color", "#212529")),
+        ),
+    )
+    return fig
+
 def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
     st.subheader("🧠 Microtransformer #2: KG-RAG Extractor (LatentMoE)")
     st.markdown("""
@@ -7415,7 +7444,8 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
     32 specialized latent domains in a compressed 24-dimensional space, keeping the parameter count <500K 
     for rapid ONNX edge inference.
 
-    **Upgrades:** ontology-prior pre-training, path ranking, LLM↔MT cache linkage, ONNX parity check.
+    **Upgrades:** ontology-prior pre-training, path ranking, LLM↔MT cache linkage, ONNX parity check,
+    per-token heatmap, live restyling.
     """)
 
     if not analysis_data or "nx_graph" not in analysis_data:
@@ -7427,7 +7457,28 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
     num_nodes = len(concept_to_id)
     metrics = get_metrics_logger()
 
-    # --- Load or init model with caching + prior training (U1, U2) ---
+    # --- Customization expander ---
+    with st.expander("🎨 Visualization Settings", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            mt_seed = st.number_input(
+                "Random seed", min_value=0, max_value=9999, value=42, step=1, key="mt_seed"
+            )
+        with c2:
+            mt_cmap = st.selectbox(
+                "Colormap",
+                ["viridis", "plasma", "inferno", "magma", "cividis", "turbo",
+                 "jet", "hot", "rdylgn", "rdylbu", "spectral", "blues", "reds"],
+                index=0, key="mt_cmap",
+            )
+        with c3:
+            theme_name = st.selectbox(
+                "Theme", list(THEME_PRESETS.keys()), index=0, key="mt_theme"
+            )
+        theme = THEME_PRESETS[theme_name]
+        scale = plotly_continuous_scale(mt_cmap)
+
+    # --- Load or init model with caching + prior training + seed ---
     graph_version = hash(str(sorted(concept_to_id.keys())))
     model_key = "kg_model"
     version_key = "graph_version"
@@ -7437,17 +7488,16 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
     if model_key not in st.session_state or st.session_state.get(version_key) != graph_version:
         metrics.start_step("Microtransformer model init")
         with st.spinner("Initializing LatentMoE model with ontology prior..."):
-            kg_model = prior_train_mt(num_nodes, concept_to_id, ontology, steps=60, lr=5e-3, seed=42)
+            torch.manual_seed(int(mt_seed))
+            kg_model = prior_train_mt(num_nodes, concept_to_id, ontology, steps=60, lr=5e-3, seed=int(mt_seed))
             kg_model.eval()
             st.session_state[model_key] = kg_model
             st.session_state[version_key] = graph_version
             st.session_state[mt_cache_key] = {}
-            # Persist state dict into analysis_data for disk survivability
             analysis_data["mt_state_dict"] = kg_model.state_dict()
         metrics.end_step({"num_nodes": num_nodes, "n_experts": kg_model.n_experts})
     else:
         kg_model = st.session_state[model_key]
-        # If we have a cached state dict from disk, ensure consistency
         if "mt_state_dict" in analysis_data and isinstance(analysis_data["mt_state_dict"], dict):
             try:
                 kg_model.load_state_dict(analysis_data["mt_state_dict"])
@@ -7488,7 +7538,6 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
             metrics.start_step("Microtransformer forward pass")
             paths = ontology.infer_path(selected_mat, selected_prop, max_depth=3)
             if paths:
-                # U3: rank paths with MT
                 ranked_paths = rank_paths_with_mt(kg_model, paths, concept_to_id)
                 path = ranked_paths[0]
                 st.success(f"Processing Path (ranked): {' → '.join(path)}")
@@ -7497,6 +7546,7 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
                 mt_cache = st.session_state[mt_cache_key]
                 if path_key in mt_cache:
                     avg_weights = mt_cache[path_key]
+                    routing_np = mt_cache.get(path_key + "_routing")
                     st.info("Loaded from path cache ⚡")
                 else:
                     node_indices = [concept_to_id.get(n, 0) for n in path]
@@ -7513,51 +7563,27 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
                     with torch.no_grad():
                         out, routing_weights = kg_model(node_seq, edge_seq)
                     avg_weights = routing_weights.mean(dim=1).squeeze(0).numpy()
+                    routing_np = routing_weights.squeeze(0).numpy()
                     mt_cache[path_key] = avg_weights
+                    mt_cache[path_key + "_routing"] = routing_np
 
-                # Store last run for GraphRAG prior (U4)
-                st.session_state[mt_run_key] = {"avg": avg_weights, "path": path}
+                # Persist for live restyling
+                st.session_state[mt_run_key] = {
+                    "avg": avg_weights,
+                    "routing": routing_np,
+                    "path": path,
+                }
                 analysis_data["mt_last_run"] = st.session_state[mt_run_key]
 
-                df_experts = pd.DataFrame({
-                    "Expert Domain": TE_EXPERT_LABELS,
-                    "Activation Weight": avg_weights
-                }).sort_values("Activation Weight", ascending=False)
-
-                fig = px.bar(
-                    df_experts, x="Expert Domain", y="Activation Weight",
-                    title="LatentMoE Expert Routing Activation (Averaged over Path)",
-                    color="Activation Weight",
-                    color_continuous_scale="Viridis"
-                )
-                fig.update_layout(xaxis_tickangle=-45, height=500)
-                st.plotly_chart(fig, use_container_width=True)
-
-                st.markdown("**Top Activated Experts:**")
-                top_experts = df_experts.head(4)
-                cols = st.columns(4)
-                for i, (_, row) in enumerate(top_experts.iterrows()):
-                    cols[i].metric(label=row["Expert Domain"], value=f"{row['Activation Weight']:.3f}")
-
-                # Interpretation map
-                interpretation_map = {
-                    "Doping Effects": "Carrier tuning via dopant atoms",
-                    "Carrier Concentration": "Free carrier density governs conductivity",
-                    "Seebeck Coefficient": "Thermopower response to temperature gradient",
-                    "Phonon Scattering": "Lattice thermal conductivity suppression",
-                    "Band Convergence": "Valley degeneracy enhancement",
-                    "ZT Figure of Merit": "Overall thermoelectric performance",
-                }
-                st.markdown("**Reasoning Chain:**")
-                for _, row in top_experts.head(3).iterrows():
-                    caption = interpretation_map.get(row["Expert Domain"], "Domain-specific latent mechanism")
-                    st.markdown(f"- **{row['Expert Domain']}** ({row['Activation Weight']:.3f}): {caption}")
+                prior_hit = compute_mt_top1_prior_hit(kg_model, path, concept_to_id, ontology)
+                metrics.end_step({
+                    "path_len": len(path),
+                    "expert_activations": avg_weights.tolist(),
+                    "mt_top1_prior_hit": round(prior_hit, 3),
+                })
             else:
                 st.warning("No inference path found between selected nodes.")
-            prior_hit = compute_mt_top1_prior_hit(kg_model, path, concept_to_id, ontology) if paths else 0.0
-            metrics.end_step({"path_len": len(path) if paths else 0,
-                              "expert_activations": avg_weights.tolist() if paths else [],
-                              "mt_top1_prior_hit": round(prior_hit, 3)})
+                metrics.end_step({"path_len": 0})
 
     # --- Run on query highlight paths ---
     if last_analysis and last_analysis.highlight_paths:
@@ -7588,6 +7614,63 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
                 st.dataframe(pd.DataFrame(results), use_container_width=True)
             metrics.end_step({"n_paths": len(results)})
 
+    # --- Live restyling: render from mt_last_run if available ---
+    run = st.session_state.get(mt_run_key)
+    if run:
+        path = run["path"]
+        routing_np = run["routing"]
+        avg_weights = run["avg"]
+        token_labels = [n.replace("_", " ").title() for n in path]
+
+        # 1. Average expert activation bar chart
+        df_experts = pd.DataFrame({
+            "Expert Domain": TE_EXPERT_LABELS,
+            "Activation Weight": avg_weights
+        }).sort_values("Activation Weight", ascending=False)
+
+        fig_bar = px.bar(
+            df_experts, x="Expert Domain", y="Activation Weight",
+            title="LatentMoE Expert Routing Activation (Averaged over Path)",
+            color="Activation Weight", color_continuous_scale=scale,
+        )
+        fig_bar.update_layout(xaxis_tickangle=-45, height=500)
+        apply_mt_chart_style(fig_bar, theme)
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+        # 2. Per-token heatmap
+        fig_hm = px.imshow(
+            routing_np,
+            x=TE_EXPERT_LABELS,
+            y=token_labels,
+            labels=dict(x="Expert Domain", y="Path Token", color="Weight"),
+            title="Per-Token Expert Routing Heatmap",
+            color_continuous_scale=scale,
+            aspect="auto",
+        )
+        apply_mt_chart_style(fig_hm, theme)
+        st.plotly_chart(fig_hm, use_container_width=True)
+
+        # 3. Top activated experts metrics
+        st.markdown("**Top Activated Experts:**")
+        top_experts = df_experts.head(4)
+        cols = st.columns(4)
+        for i, (_, row) in enumerate(top_experts.iterrows()):
+            cols[i].metric(label=row["Expert Domain"], value=f"{row['Activation Weight']:.3f}")
+
+        # 4. Reasoning chain interpretation
+        interpretation_map = {
+            "Doping Effects": "Carrier tuning via dopant atoms",
+            "Carrier Concentration": "Free carrier density governs conductivity",
+            "Seebeck Coefficient": "Thermopower response to temperature gradient",
+            "Phonon Scattering": "Lattice thermal conductivity suppression",
+            "Band Convergence": "Valley degeneracy enhancement",
+            "ZT Figure of Merit": "Overall thermoelectric performance",
+        }
+        st.markdown("**Reasoning Chain:**")
+        for _, row in top_experts.head(3).iterrows():
+            caption = interpretation_map.get(row["Expert Domain"], "Domain-specific latent mechanism")
+            st.markdown(f"- **{row['Expert Domain']}** ({row['Activation Weight']:.3f}): {caption}")
+
     st.markdown("---")
     st.markdown("#### 📤 Edge Deployment (Ubuntu/Lubuntu ONNX Export)")
     st.write("Export the Microtransformer to an ONNX file for deployment on edge thin-clients.")
@@ -7615,7 +7698,7 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
                     with open(onnx_path, "rb") as f:
                         onnx_bytes = f.read()
 
-                    # U5: ONNX parity check
+                    # ONNX parity check
                     try:
                         import onnxruntime as ort
                         sess = ort.InferenceSession(onnx_path)
@@ -7647,13 +7730,8 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
             finally:
                 metrics.end_step({"success": True})
 
-    # --- Live metrics panel in-tab ---
     render_live_metrics_panel()
 
-
-# ============================================================================
-# SIDEBAR (adapted to TE)
-# ============================================================================
 def render_sidebar() -> None:
     with st.sidebar:
         st.header("⚙️ Configuration v1.0 (Thermoelectric)")
