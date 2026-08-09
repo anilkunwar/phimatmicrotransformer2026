@@ -7656,7 +7656,6 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
                         f"No path found between `{selected_src}` and "
                         f"`{selected_tgt}` in either the graph or the ontology."
                     )
-                    # Show connected concepts to help user
                     src_related = ontology.get_related_concepts(selected_src)
                     if src_related:
                         st.markdown(
@@ -7666,165 +7665,174 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
                                 for t, r, c in sorted(src_related, key=lambda x: -x[2])[:8]
                             )
                         )
-                    return
+                    path = None  # ensure path is None so we don't save bad state
 
-            st.success(f"🚀 Processing Path: {' → '.join(path)}")
+            if path is None:
+                st.session_state.pop("mt_last_run", None)
+            else:
+                st.success(f"🚀 Processing Path: {' → '.join(path)}")
 
-            # ─── Tokenize path ───────────────────────────────────────
-            node_indices = []
-            ontology_only_tokens = []
-            for n in path:
-                if n in concept_to_id:
-                    node_indices.append(concept_to_id[n])
-                else:
-                    # Ontology-only concept: use ID 0 as fallback
-                    node_indices.append(0)
-                    ontology_only_tokens.append(n)
-
-            node_seq = torch.tensor([node_indices], dtype=torch.long)
-
-            # ─── Build edge sequence ─────────────────────────────────
-            edge_indices = []
-            for i in range(len(path) - 1):
-                edge_data = nx_graph.get_edge_data(path[i], path[i + 1])
-                if edge_data:
-                    rel_str = edge_data.get('edge_type', 'semantic').upper()
-                    edge_indices.append(RELATIONSHIP_TO_IDX.get(rel_str, 0))
-                else:
-                    # Check ontology relationships
-                    rel = next(
-                        (r for r in ontology.relationships
-                         if r.source == path[i] and r.target == path[i + 1]),
-                        None,
-                    )
-                    if rel:
-                        edge_indices.append(RELATIONSHIP_TO_IDX.get(rel.rel_type.name, 0))
+                # ─── Tokenize path ───────────────────────────────────────
+                node_indices = []
+                ontology_only_tokens = []
+                for n in path:
+                    if n in concept_to_id:
+                        node_indices.append(concept_to_id[n])
                     else:
-                        # Unknown edge type — use INFLUENCES as generic
-                        edge_indices.append(RELATIONSHIP_TO_IDX.get("INFLUENCES", 0))
+                        node_indices.append(0)
+                        ontology_only_tokens.append(n)
 
-            edge_seq = torch.tensor([edge_indices], dtype=torch.long)
+                node_seq = torch.tensor([node_indices], dtype=torch.long)
 
-            # ─── Warnings about ontology-only tokens ─────────────────
-            if ontology_only_tokens:
-                st.caption(
-                    f"⚠️ Tokens {ontology_only_tokens} are ontology-only (not in graph). "
-                    f"Their node embeddings are generic (ID 0). Expert routing still works "
-                    f"because it depends on the router network, not the node embeddings."
-                )
+                # ─── Build edge sequence ─────────────────────────────────
+                edge_indices = []
+                for i in range(len(path) - 1):
+                    edge_data = nx_graph.get_edge_data(path[i], path[i + 1])
+                    if edge_data:
+                        rel_str = edge_data.get('edge_type', 'semantic').upper()
+                        edge_indices.append(RELATIONSHIP_TO_IDX.get(rel_str, 0))
+                    else:
+                        rel = next(
+                            (r for r in ontology.relationships
+                             if r.source == path[i] and r.target == path[i + 1]),
+                            None,
+                        )
+                        if rel:
+                            edge_indices.append(RELATIONSHIP_TO_IDX.get(rel.rel_type.name, 0))
+                        else:
+                            edge_indices.append(RELATIONSHIP_TO_IDX.get("INFLUENCES", 0))
 
-            # ─── Forward pass ────────────────────────────────────────
-            with torch.no_grad():
-                out, routing_weights = kg_model(node_seq, edge_seq)
+                edge_seq = torch.tensor([edge_indices], dtype=torch.long)
 
-            # routing_weights: (1, seq_len, 32)
-            avg_weights = routing_weights.mean(dim=1).squeeze(0).numpy()
+                # ─── Warnings about ontology-only tokens ─────────────────
+                if ontology_only_tokens:
+                    st.caption(
+                        f"⚠️ Tokens {ontology_only_tokens} are ontology-only (not in graph). "
+                        f"Their node embeddings are generic (ID 0). Expert routing still works "
+                        f"because it depends on the router network, not the node embeddings."
+                    )
 
-            # ─── Per-token routing heatmap ──────────────────────────
-            st.markdown("#### 📊 Per-Token Expert Routing Heatmap")
-            token_labels = [n.replace("_", " ").title() for n in path]
-            per_token_df = pd.DataFrame(
-                routing_weights.squeeze(0).numpy(),
-                index=token_labels,
-                columns=TE_EXPERT_LABELS,
+                # ─── Forward pass ────────────────────────────────────────
+                with torch.no_grad():
+                    out, routing_weights = kg_model(node_seq, edge_seq)
+
+                avg_weights = routing_weights.mean(dim=1).squeeze(0).numpy()
+
+                # ─── Persist for restyling ───────────────────────────────
+                st.session_state["mt_last_run"] = {
+                    "path": path,
+                    "routing": routing_weights.squeeze(0).numpy(),   # (seq_len, 32)
+                    "avg": avg_weights,
+                }
+
+    # ─── RENDER (every rerun; reads current customization) ─────────────
+    run = st.session_state.get("mt_last_run")
+    if not run:
+        st.info("Press ⚡ Run once — afterwards you can restyle freely.")
+    else:
+        path        = run["path"]
+        routing_np  = run["routing"]
+        avg_weights = run["avg"]
+        token_labels = [n.replace("_", " ").title() for n in path]
+        theme = THEME_PRESETS[st.session_state.get("theme", "Bright (Default)")]
+        scale = plotly_continuous_scale(st.session_state.get("mt_cmap", "viridis"))
+
+        st.success(f"🚀 Processing Path: {' → '.join(path)}")
+
+        # ─── Per-token routing heatmap ──────────────────────────
+        st.markdown("#### 📊 Per-Token Expert Routing Heatmap")
+        per_token_df = pd.DataFrame(routing_np, index=token_labels, columns=TE_EXPERT_LABELS)
+        fig_heat = px.imshow(
+            per_token_df.T,
+            labels=dict(x="Path Token", y="Expert Domain"),
+            color_continuous_scale=scale, aspect="auto", height=400,
+        )
+        st.plotly_chart(apply_mt_chart_style(fig_heat, theme), use_container_width=True)
+
+        # ─── Averaged bar chart ──────────────────────────────────
+        df_experts = pd.DataFrame({
+            "Expert Domain": TE_EXPERT_LABELS,
+            "Activation Weight": avg_weights,
+        }).sort_values("Activation Weight", ascending=False)
+
+        fig = px.bar(
+            df_experts,
+            x="Expert Domain",
+            y="Activation Weight",
+            title=f"LatentMoE Expert Routing: {' → '.join(token_labels)}",
+            color="Activation Weight",
+            color_continuous_scale=scale,
+        )
+        fig.update_layout(xaxis_tickangle=-45, height=500)
+        st.plotly_chart(apply_mt_chart_style(fig, theme), use_container_width=True)
+
+        # ─── Top experts metric cards ────────────────────────────
+        st.markdown("**Top Activated Experts:**")
+        top_experts = df_experts.head(4)
+        cols = st.columns(4)
+        for i, (_, row) in enumerate(top_experts.iterrows()):
+            cols[i].metric(
+                label=str(row["Expert Domain"]),
+                value=f"{float(row['Activation Weight']):.3f}",
             )
-            scale = plotly_continuous_scale(st.session_state.get("mt_cmap", "viridis"))
-            theme = THEME_PRESETS[st.session_state.get("theme", "Bright (Default)")]
 
-            fig_heat = px.imshow(
-                per_token_df.T,
-                labels=dict(x="Path Token", y="Expert Domain"),
-                color_continuous_scale=scale, aspect="auto", height=400,
+        # ─── Scientific interpretation ────────────────────────────
+        st.markdown("#### 🔬 Scientific Interpretation")
+        interpretation_map = {
+            "Doping Effects": "The model recognizes this path involves dopant-induced changes to electronic structure.",
+            "Carrier Concentration": "Routing highlights carrier density as the key mediating variable between doping and Seebeck.",
+            "Seebeck Coefficient": "The path targets Seebeck — the model allocates expert capacity to decode S.",
+            "Band Structure": "Doping shifts the Fermi level and band edges — the model picks this up.",
+            "Band Convergence": "Multiple bands converging enhances the density-of-states effective mass and S.",
+            "Carrier Scattering": "Ionized impurity scattering from dopants affects both μ and S.",
+            "Density of States": "Doping alters the DOS near E_F, directly impacting S via M*.",
+            "Electrical Conductivity": "The σ compensation effect: higher n → higher σ but lower S.",
+            "General Composition": "Compositional changes cascade through multiple transport properties.",
+            "Stoichiometry Limits": "Deviations from ideal stoichiometry create point defects that scatter phonons.",
+            "Alloying Disorders": "Mass disorder from alloying creates additional phonon scattering channels.",
+            "Lattice Thermal Cond.": "The primary beneficiary of phonon engineering strategies.",
+            "Phonon Scattering": "Central mechanism for reducing κ_l without harming electrical transport.",
+            "Grain Boundary Scatter": "Nanostructuring introduces grain boundaries that scatter mid-frequency phonons.",
+            "Point Defects": "Vacancies, interstitials, and antisites act as phonon scattering centers.",
+            "Nanostructuring": "Multi-scale structural engineering for phonon transport control.",
+            "SPS Synthesis": "Rapid SPS processing preserves nanostructure while achieving full density.",
+            "Hot Pressing": "Conventional densification that may coarsen microstructure.",
+            "Melt Spinning": "Rapid solidification creates supersaturated solid solutions with refined microstructure.",
+            "Ball Milling": "Mechanical alloying produces nanocrystalline powders with high defect density.",
+            "Temperature": "Temperature activates different scattering mechanisms and carrier populations.",
+            "Bipolar Effects": "At high T, minority carrier excitation degrades S and increases κ_e.",
+            "ZT Figure of Merit": "The ultimate performance metric combining S, σ, and κ.",
+            "Power Factor": "S²σ determines the electrical power output of the thermoelectric leg.",
+        }
+        top3_names = df_experts.head(3)["Expert Domain"].tolist()
+        for expert_name in top3_names:
+            interp = interpretation_map.get(expert_name)
+            if interp:
+                st.info(f"**{expert_name}**: {interp}")
+
+        # ─── Path reasoning chain ───────────────────────────────
+        st.markdown("#### 🔗 Reasoning Chain Along Path")
+        for i in range(len(path) - 1):
+            src_name = path[i].replace("_", " ").title()
+            tgt_name = path[i + 1].replace("_", " ").title()
+            rel_desc = "unknown"
+            for r in ontology.relationships:
+                if r.source == path[i] and r.target == path[i + 1]:
+                    rel_desc = f"{r.rel_type.value} (confidence: {r.confidence:.2f})"
+                    break
+            token_experts = pd.DataFrame({
+                "Expert": TE_EXPERT_LABELS,
+                "Weight": routing_np[i],
+            }).sort_values("Weight", ascending=False)
+            top2 = ", ".join(
+                f"{row['Expert']} ({row['Weight']:.3f})"
+                for _, row in token_experts.head(2).iterrows()
             )
-            st.plotly_chart(apply_mt_chart_style(fig_heat, theme), use_container_width=True)
-
-            # ─── Averaged bar chart ──────────────────────────────────
-            df_experts = pd.DataFrame({
-                "Expert Domain": TE_EXPERT_LABELS,
-                "Activation Weight": avg_weights,
-            }).sort_values("Activation Weight", ascending=False)
-
-            fig = px.bar(
-                df_experts,
-                x="Expert Domain",
-                y="Activation Weight",
-                title=f"LatentMoE Expert Routing: {' → '.join(token_labels)}",
-                color="Activation Weight",
-                color_continuous_scale=scale,
+            st.markdown(
+                f"**Step {i+1}**: `{src_name}` --[{rel_desc}]--> `{tgt_name}`  "
+                f"*(top experts: {top2})*"
             )
-            fig.update_layout(xaxis_tickangle=-45, height=500)
-            st.plotly_chart(apply_mt_chart_style(fig, theme), use_container_width=True)
 
-            # ─── Top experts metric cards ────────────────────────────
-            st.markdown("**Top Activated Experts:**")
-            top_experts = df_experts.head(4)
-            cols = st.columns(4)
-            for i, (_, row) in enumerate(top_experts.iterrows()):
-                cols[i].metric(
-                    label=str(row["Expert Domain"]),
-                    value=f"{float(row['Activation Weight']):.3f}",
-                )
-
-            # ─── Scientific interpretation ────────────────────────────
-            st.markdown("#### 🔬 Scientific Interpretation")
-            interpretation_map = {
-                "Doping Effects": "The model recognizes this path involves dopant-induced changes to electronic structure.",
-                "Carrier Concentration": "Routing highlights carrier density as the key mediating variable between doping and Seebeck.",
-                "Seebeck Coefficient": "The path targets Seebeck — the model allocates expert capacity to decode S.",
-                "Band Structure": "Doping shifts the Fermi level and band edges — the model picks this up.",
-                "Band Convergence": "Multiple bands converging enhances the density-of-states effective mass and S.",
-                "Carrier Scattering": "Ionized impurity scattering from dopants affects both μ and S.",
-                "Density of States": "Doping alters the DOS near E_F, directly impacting S via M*.",
-                "Electrical Conductivity": "The σ compensation effect: higher n → higher σ but lower S.",
-                "General Composition": "Compositional changes cascade through multiple transport properties.",
-                "Stoichiometry Limits": "Deviations from ideal stoichiometry create point defects that scatter phonons.",
-                "Alloying Disorders": "Mass disorder from alloying creates additional phonon scattering channels.",
-                "Lattice Thermal Cond.": "The primary beneficiary of phonon engineering strategies.",
-                "Phonon Scattering": "Central mechanism for reducing κ_l without harming electrical transport.",
-                "Grain Boundary Scatter": "Nanostructuring introduces grain boundaries that scatter mid-frequency phonons.",
-                "Point Defects": "Vacancies, interstitials, and antisites act as phonon scattering centers.",
-                "Nanostructuring": "Multi-scale structural engineering for phonon transport control.",
-                "SPS Synthesis": "Rapid SPS processing preserves nanostructure while achieving full density.",
-                "Hot Pressing": "Conventional densification that may coarsen microstructure.",
-                "Melt Spinning": "Rapid solidification creates supersaturated solid solutions with refined microstructure.",
-                "Ball Milling": "Mechanical alloying produces nanocrystalline powders with high defect density.",
-                "Temperature": "Temperature activates different scattering mechanisms and carrier populations.",
-                "Bipolar Effects": "At high T, minority carrier excitation degrades S and increases κ_e.",
-                "ZT Figure of Merit": "The ultimate performance metric combining S, σ, and κ.",
-                "Power Factor": "S²σ determines the electrical power output of the thermoelectric leg.",
-            }
-            top3_names = df_experts.head(3)["Expert Domain"].tolist()
-            for expert_name in top3_names:
-                interp = interpretation_map.get(expert_name)
-                if interp:
-                    st.info(f"**{expert_name}**: {interp}")
-
-            # ─── Path reasoning chain ───────────────────────────────
-            st.markdown("#### 🔗 Reasoning Chain Along Path")
-            for i in range(len(path) - 1):
-                src_name = path[i].replace("_", " ").title()
-                tgt_name = path[i + 1].replace("_", " ").title()
-                # Find the relationship
-                rel_desc = "unknown"
-                for r in ontology.relationships:
-                    if r.source == path[i] and r.target == path[i + 1]:
-                        rel_desc = f"{r.rel_type.value} (confidence: {r.confidence:.2f})"
-                        break
-                # Get expert activations for this token position
-                token_experts = pd.DataFrame({
-                    "Expert": TE_EXPERT_LABELS,
-                    "Weight": routing_weights[0, i].numpy(),
-                }).sort_values("Weight", ascending=False)
-                top2 = ", ".join(
-                    f"{row['Expert']} ({row['Weight']:.3f})"
-                    for _, row in token_experts.head(2).iterrows()
-                )
-                st.markdown(
-                    f"**Step {i+1}**: `{src_name}` --[{rel_desc}]--> `{tgt_name}`  "
-                    f"*(top experts: {top2})*"
-                )
-
-    # ─── ONNX EXPORT (unchanged) ─────────────────────────────────────
     st.markdown("---")
     st.markdown("#### 📤 Edge Deployment (Ubuntu/Lubuntu ONNX Export)")
     if st.button("📦 Export to ONNX"):
