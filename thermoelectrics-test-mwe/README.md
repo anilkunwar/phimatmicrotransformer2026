@@ -15,9 +15,9 @@
 
 [![integratedllmgraphte](https://img.shields.io/badge/thermoelectrics-v5-orange)](https://single-stage-graphformer5.streamlit.app/) (Improved answer from microtransformer and needs to be improved, LatenMOE does finds options as well as infer on multinetwork paths to find any inference, Options of query-distilled concept graph and default entirety analysis concept graph, Customizable nodes in the Concept Graph)
 
-[![integratedllmgraphte](https://img.shields.io/badge/thermoelectrics-v6-turquoise)](https://single-stage-graphformer6.streamlit.app/) (Improved answer from microtransformer and robust visualization, LatenMOE does finds options as well as infer on multinetwork paths to find any inference, Options of query-distilled concept graph and default entirety analysis concept graph, Customizable nodes in the Concept Graph)
+[![integratedllmgraphte](https://img.shields.io/badge/thermoelectrics-v6-turquoise)](https://single-stage-graphformer6.streamlit.app/) (Improved answer from microtransformer and robust visualization, LatenMOE does finds options as well as infer on multinetwork paths to find any inference, The customizable of graphs possible only before running the LatentMoE inference, Options of query-distilled concept graph and default entirety analysis concept graph, Customizable nodes in the Concept Graph)
 
-
+[![integratedllmgraphte](https://img.shields.io/badge/thermoelectrics-v7-turquoise)](https://single-stage-graphformer7.streamlit.app/) (Improved answer from microtransformer and robust visualization, LatenMOE does finds options as well as infer on multinetwork paths to find any inference, The customizable of graphs possible even after running the LatentMoE inference, Options of query-distilled concept graph and default entirety analysis concept graph, Customizable nodes in the Concept Graph)
 
 # Multi Stage Solution that Designates Each Space to Use RAM Space  Separately i.e.  LLM-Guided Query (S1, N1 RAM) -->>  Concept Graph  (S2, N2 RAM) -->>  Microtransformer (S3, N3 RAM) 
 
