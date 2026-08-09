@@ -503,17 +503,27 @@ def apply_mt_chart_style(fig, theme: Dict):
         paper_bgcolor=theme["plotly_paper"], plot_bgcolor=theme["plotly_bg"],
     )
     for ax in (fig.update_xaxes, fig.update_yaxes):
-        ax(showgrid=st.session_state.get("mt_show_grid", False),
-           gridcolor=theme["grid_color"],
-           tickfont=dict(family=fam, size=tsize, color=theme["axis_color"]),
-           title_font=dict(family=fam, size=tsize + 1))
-    fig.update_colorbars(
-        title=dict(text=st.session_state.get("mt_cbar_title", "Weight"),
-                   font=dict(family=fam, size=tsize + 1, color=theme["font"])),
-        tickfont=dict(family=fam, size=max(8, tsize - 1), color=theme["axis_color"]),
-        len=st.session_state.get("mt_cbar_len", 0.8),
-        thickness=st.session_state.get("mt_cbar_thick", 14),
-        outlinewidth=0,
+        ax(
+            showgrid=st.session_state.get("mt_show_grid", False),
+            gridcolor=theme["grid_color"],
+            tickfont=dict(family=fam, size=tsize, color=theme["axis_color"]),
+            title_font=dict(family=fam, size=tsize + 1),
+        )
+    # update_colorbars doesn't exist on Figure — use layout-level coloraxis
+    cbar_title = st.session_state.get("mt_cbar_title", "Weight")
+    fig.update_layout(
+        coloraxis=dict(
+            colorbar=dict(
+                title=dict(text=cbar_title,
+                             font=dict(family=fam, size=tsize + 1,
+                                         color=theme["font"])),
+                tickfont=dict(family=fam, size=max(8, tsize - 1),
+                                color=theme["axis_color"]),
+                thickness=st.session_state.get("mt_cbar_thick", 14),
+                outlinewidth=0,
+                len=st.session_state.get("mt_cbar_len", 0.8),
+            )
+        )
     )
     return fig
 
@@ -7751,8 +7761,8 @@ def render_microtransformer_kg_rag_tab(analysis_data: Dict, ontology: Any):
             cols = st.columns(4)
             for i, (_, row) in enumerate(top_experts.iterrows()):
                 cols[i].metric(
-                    label=row["Expert Domain"],
-                    value=f"{row['Activation Weight']:.3f}",
+                    label=str(row["Expert Domain"]),
+                    value=f"{float(row['Activation Weight']):.3f}",
                 )
 
             # ─── Scientific interpretation ────────────────────────────
